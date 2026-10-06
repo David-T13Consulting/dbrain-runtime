@@ -5,7 +5,7 @@ A profile is data, not convention. scope.py enforces it; nothing else may widen 
 import os
 from pathlib import Path
 
-VAULT = Path(os.environ.get("DBRAIN_VAULT", Path.home() / "Documents" / "Dbrain2"))
+VAULT = Path(os.environ.get("DBRAIN_VAULT", Path.home() / "Work" / "Dbrain2"))
 
 # Traces and results live outside the vault (P2.2 "Done when" 6), in a git-ignored folder
 # of this repository (David, Q23, 5 Oct: as lean as possible while keeping the boundary).
