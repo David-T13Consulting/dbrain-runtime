@@ -112,7 +112,7 @@ not seen at all.
 
 Raw output (traces, reports, measurement evidence) lives in `artifacts/` in this repo,
 git-ignored (David, Q23). It was under `~/Documents/Dbrain2-artifacts/runtime/` until 5 Oct.
-The 1 Oct benchmark inputs the dev cases come from stay in `Dbrain2-artifacts/local-models/`.
+The 1 Oct benchmark inputs the dev cases come from are in `~/Documents/Source_Material/AI_Second_Brain/local-models/` (moved from `~/Documents/Dbrain2-artifacts/` on 6 Oct).
 
 ## What is proven, and what is not
 

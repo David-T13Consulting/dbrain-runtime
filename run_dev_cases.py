@@ -19,7 +19,7 @@ from pathlib import Path
 from dbrain import adapter as adapter_mod
 from dbrain import answer, config, index, outpath, retrieve
 
-BENCH = Path.home() / "Documents/Dbrain2-artifacts/local-models/2026-10-01/benchmark/retrieval-v1"
+BENCH = Path.home() / "Documents/Source_Material/AI_Second_Brain/local-models/2026-10-01/benchmark/retrieval-v1"
 RESERVED = "acceptance-reserved.json"
 
 
