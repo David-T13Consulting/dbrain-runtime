@@ -67,4 +67,11 @@ DEFAULT = Profile("default", files=SCOPED_FILES, sections=SCOPED_SECTIONS)
 # now that the brief's allowlist *is* the dev-case corpus.
 DEVCASES = Profile("devcases", files=SCOPED_FILES, sections=SCOPED_SECTIONS)
 
-PROFILES = {p.name: p for p in (DEFAULT, DEVCASES)}
+# MVP-phone (David, Q34, 5 Oct): the whole vault, read-only, for questions from the
+# iPhone. Root "" is the vault itself. Dot-folders are excluded; the reserved acceptance
+# cases live outside the vault, so they are unreachable by construction. Not used by the
+# dev-case measurements, which stay on the three-file corpus.
+MVP_WHOLE_VAULT = Profile("mvp-whole-vault", roots=("",), exclude_hidden=True,
+                          skip_unlabelled=True)
+
+PROFILES = {p.name: p for p in (DEFAULT, DEVCASES, MVP_WHOLE_VAULT)}
