@@ -1,8 +1,10 @@
 """MVP-phone /ask service: the boundary, not the model (brief MVP-phone, Done when)."""
+import faulthandler
 import http.client
 import json
 import os
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -81,6 +83,10 @@ class EndpointFixture(unittest.TestCase):
     """A live /ask server on loopback with a stub model; no tests of its own."""
 
     def setUp(self):
+        # Watchdog: a test that hangs (setup, body or teardown) dumps every thread's stack
+        # and exits non-zero after 60 s instead of hanging the suite.
+        faulthandler.dump_traceback_later(60, exit=True)
+        self.addCleanup(faulthandler.cancel_dump_traceback_later)
         self.vault = whole_vault_fixture()
         self.artifacts = Path(self.vault.parent / (self.vault.name + "-artifacts"))
         self._saved = config.ARTIFACTS
@@ -191,6 +197,19 @@ class AskEndpointTest(EndpointFixture):
         for f in self.artifacts.rglob("*"):
             if f.is_file():
                 self.assertNotIn(TOKEN, f.read_text())
+
+    def test_accept_never_blocks_the_serving_loop(self):
+        # The blocking scenario suspected behind the P2.4 test hang (not proven): the
+        # selector says "ready" but no connection is there. accept() on
+        # the listening socket must time out, not block, so shutdown() is always reached.
+        self.assertEqual(self.server.socket.gettimeout(), serve._Server.ACCEPT_TIMEOUT)
+        probe = serve.build_server("127.0.0.1", 0, self.service)
+        try:
+            started = time.monotonic()
+            probe._handle_request_noblock()   # nothing is connecting
+            self.assertLess(time.monotonic() - started, 5)
+        finally:
+            probe.server_close()
 
     def test_a_peer_outside_the_tailnet_is_refused(self):
         self.assertFalse(serve.allowed_address("192.168.1.30"))

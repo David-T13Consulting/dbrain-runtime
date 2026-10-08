@@ -1041,6 +1041,17 @@ def llama_health(endpoint=None):
 
 
 class _Server(ThreadingHTTPServer):
+    # A timeout on the listening socket, so accept() never blocks the serving loop: if the
+    # selector reports a connection that is gone by the time accept() runs, the loop gets a
+    # timeout (an OSError the stdlib already swallows), goes back to polling, and still sees
+    # shutdown(). Without it, shutdown() could wait for ever: the suspected cause of the
+    # intermittent P2.4 test hang, not proven (Codex consultation, 8 Oct). Accepted connections get their own timeout in Handler.setup().
+    ACCEPT_TIMEOUT = 0.5
+
+    def server_activate(self):
+        super().server_activate()
+        self.socket.settimeout(self.ACCEPT_TIMEOUT)
+
     def handle_error(self, request, client_address):
         # No traceback: a fixed event only (a dropped connection, a client gone mid-reply).
         sys.stderr.write("%s connection error\n" % time.strftime("%Y-%m-%dT%H:%M:%S"))
