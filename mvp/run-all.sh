@@ -7,14 +7,17 @@ set -C   # noclobber; every log is a new file per start, never appended (`>>` fo
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 APP="$HOME/Library/Application Support/dbrain"
 SERVER="$APP/llama/llama-b11146/llama-server"
-MODEL="$APP/models/Qwen3-4B-Q4_K_M.gguf"
+# Default model: Gemma 4 E4B QAT Q4_0, picked by T9 and adopted by David (Q84 (a), 8 Oct).
+MODEL="$APP/models/gemma-4-E4B_q4_0-it.gguf"
+MODEL_PIN=676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee
 LOGS=$(PYTHONPATH="$HERE" python3 -c "from dbrain import outpath; print(outpath.make_dir('$HERE/artifacts/logs', fresh=False))") || exit 1
 [ -x "$SERVER" ] && [ -f "$MODEL" ] || { echo "run mvp/prepare-model.sh first" >&2; exit 1; }
+[ "$(shasum -a 256 "$MODEL" | cut -d' ' -f1)" = "$MODEL_PIN" ] || { echo "PIN MISMATCH $MODEL" >&2; exit 1; }
 
-# Model server: loopback only, offline, same settings as P2.2 run B.
+# Model server: loopback only, offline, the settings T9 measured (P2.2 run B plus --reasoning off).
 ( while :; do
     "$SERVER" -m "$MODEL" --host 127.0.0.1 --port 18087 --offline --no-webui -np 1 \
-        -c 4096 -t 4 -ngl 99 --no-cache-prompt > "$LOGS/llama-server-$(date +%Y%m%dT%H%M%S).log" 2>&1
+        -c 4096 -t 4 -ngl 99 --no-cache-prompt --reasoning off > "$LOGS/llama-server-$(date +%Y%m%dT%H%M%S).log" 2>&1
     echo "$(date '+%F %T') llama-server exited $?; restarting in 10 s" > "$LOGS/restart-llama-$(date +%Y%m%dT%H%M%S).log"
     sleep 10
   done ) &

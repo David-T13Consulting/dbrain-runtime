@@ -222,7 +222,7 @@ class LlamaCppAdapter(ModelAdapter):
         # differently - classic DNS rebinding. The request goes to the literal IP.
         self.endpoint = pin_to_address(endpoint, self.addresses[0])
         self.declared_endpoint = endpoint.rstrip("/")
-        self.model = model or os.environ.get("DBRAIN_MODEL", "Qwen3-4B-Q4_K_M")
+        self.model = model or os.environ.get("DBRAIN_MODEL", "gemma-4-E4B_q4_0-it")
         self.timeout = timeout
 
     @staticmethod

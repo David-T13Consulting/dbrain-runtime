@@ -29,8 +29,10 @@ iPhone Shortcut ── Tailscale (WireGuard) ──▶ this Air: dbrain.serve :8
 3. **Token:** in Terminal, `cd ~/Work/dbrain-runtime && ./mvp/make-token.sh`. It goes
    into the Keychain and onto the clipboard for 2 minutes. Paste it straight into the
    Shortcut (step 6). It is never stored in a file.
-4. **Model files:** `./mvp/prepare-model.sh` (copies the pinned runtime and model, about 2.5 GB,
-   into `~/Library/Application Support/dbrain/` after checking their hashes).
+4. **Model files:** `./mvp/prepare-model.sh` (installs the pinned runtime from its archive, hash-checked, if it
+   is not already in `~/Library/Application Support/dbrain/`; checks the hash of the default model, Gemma 4 E4B QAT
+   Q4_0, 5.15 GB, chosen by T9 and adopted 8 Oct, which is fetched under `models/MANIFEST.md`, never by this script;
+   the old baseline Qwen3-4B is optional: hash-checked if present, copied only if its source file is given).
 5. **Start:** double-click `mvp/Ask Brain.command`. To start at login, add that file in
    System Settings › General › Login Items. Keep its Terminal window open. It restarts the
    model or the service if either stops, and keeps the Air awake on power while it runs.

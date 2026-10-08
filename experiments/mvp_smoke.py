@@ -22,7 +22,7 @@ from dbrain import adapter, outpath, serve  # noqa: E402
 
 APP = Path.home() / "Library/Application Support/dbrain"
 SERVER = APP / "llama/llama-b11146/llama-server"
-MODEL = APP / "models/Qwen3-4B-Q4_K_M.gguf"
+MODEL = APP / "models/gemma-4-E4B_q4_0-it.gguf"  # the default since Q84 (a)
 PORT = 18765  # fixed, so the no-network sandbox profile can allow exactly this one
 # Its own model port, not the live service's 18087: with the login item running, a smoke
 # run on 18087 would fail to start its server and silently ask the live one instead.
@@ -68,7 +68,7 @@ def main(out_dir):
     log = outpath.open_for_write(out_dir / "llama-server.log")
     llama = subprocess.Popen([str(SERVER), "-m", str(MODEL), "--host", "127.0.0.1", "--port", str(LLAMA_PORT),
                               "--offline", "--no-webui", "-np", "1", "-c", "4096", "-t", "4",
-                              "-ngl", "99", "--no-cache-prompt"], stdout=log, stderr=subprocess.STDOUT)
+                              "-ngl", "99", "--no-cache-prompt", "--reasoning", "off"], stdout=log, stderr=subprocess.STDOUT)
     bearer = secrets.token_urlsafe(32)
     svc = serve.Service(bearer, model_factory=lambda: adapter.LlamaCppAdapter(endpoint=LLAMA, timeout=110),
                         model_health=lambda: serve.llama_health(LLAMA), today=lambda: SMOKE_TODAY)

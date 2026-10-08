@@ -29,13 +29,23 @@ guard
 mkdir -p "$DEST/models" "$DEST/llama"
 guard
 pin() { [ "$(shasum -a 256 "$1" | cut -d' ' -f1)" = "$2" ] || { echo "PIN MISMATCH $1" >&2; exit 1; }; }
-if [ ! -f "$DEST/models/Qwen3-4B-Q4_K_M.gguf" ]; then
+# The old baseline (Qwen3-4B) is optional since Q84 (a): checked if present, copied if its
+# source is given, otherwise skipped. The service itself runs the default model below.
+if [ -f "$DEST/models/Qwen3-4B-Q4_K_M.gguf" ]; then
+    pin "$DEST/models/Qwen3-4B-Q4_K_M.gguf" "$MODEL_PIN"
+elif [ -f "$SRC_MODEL" ]; then
     pin "$SRC_MODEL" "$MODEL_PIN"
     cp "$SRC_MODEL" "$DEST/models/Qwen3-4B-Q4_K_M.gguf"
+    pin "$DEST/models/Qwen3-4B-Q4_K_M.gguf" "$MODEL_PIN"
+else
+    echo "baseline Qwen3-4B not installed (optional)"
 fi
-pin "$DEST/models/Qwen3-4B-Q4_K_M.gguf" "$MODEL_PIN"
 if [ ! -x "$DEST/llama/llama-b11146/llama-server" ]; then
     pin "$SRC_ARCHIVE" "$ARCHIVE_PIN"
     tar -xzf "$SRC_ARCHIVE" -C "$DEST/llama"
 fi
+# The default model since Q84 (a), 8 Oct: Gemma 4 E4B QAT Q4_0, fetched under the T9 manifest
+# (models/MANIFEST.md). This script never downloads it; it only checks the pin.
+[ -f "$DEST/models/gemma-4-E4B_q4_0-it.gguf" ] || { echo "missing $DEST/models/gemma-4-E4B_q4_0-it.gguf (see models/MANIFEST.md)" >&2; exit 1; }
+pin "$DEST/models/gemma-4-E4B_q4_0-it.gguf" 676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee
 echo "ready: $DEST"
