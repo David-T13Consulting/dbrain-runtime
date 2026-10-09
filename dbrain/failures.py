@@ -30,7 +30,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import outpath
+from . import answer, outpath
 
 APP = Path.home() / "Library" / "Application Support" / "dbrain"
 STORE = APP / "failures"    # question text: the local model and David only (§7a)
@@ -42,16 +42,24 @@ TMP_PREFIX = ".tmp-"            # a record being written; never a stored failure
 TMP_MAX_AGE = 3600              # a temporary file older than this is a leftover: removed
 LOCK_NAME = ".lock"             # flock file: capture, reconcile and purge never interleave
 
-# The outcomes the phone sees that count as a failure signal (P2.7, the loop, step 1). The
-# phone's one-tap "wrong" comes later, with the Shortcut.
+# The one table of failure signals (P2.7 step C2, D113): which final outcome the phone saw
+# counts as a failure. A request may raise more than one; it is still captured once, with
+# all of them. The phone's one-tap "wrong" comes later, with the Shortcut.
 SIGNALS = {
-    "unclear": "date not understood",
-    "incomplete": "answer not supported",
-    "withheld": "declined",
-    "malformed": "unusable model reply",
-    "timeout": "no answer in time",
-    "unavailable": "model down",
+    "withheld": "no answer: the model declined, or nothing was retrieved",
+    # The date reader fails closed: any date-like text it cannot read fully makes the
+    # question `unclear` (serve.resolve_dates, _leftover), so "no date read on a date-like
+    # question" is this signal.
+    "unclear": "a date-like question whose date was not read",
+    "timeout": "no answer within the deadline (504)",
+    "unavailable": "the local model is down (503)",
+    "malformed": "the model's reply could not be used",
+    "incomplete": "a defect: an id never offered, no citation, grounding below threshold, "
+                  "or a verifier rejection (answer.DEFECTS)",
 }
+# Cited and grounded, but no verifier yet: not a failure. Counted in the audit log, never
+# stored (D113).
+UNVERIFIED = answer.UNVERIFIED
 
 _GUARD = {"outside_git": True, "private": True, "strict": True}
 _AUDIT_LOCK = threading.Lock()   # in-process; flock serialises across processes
@@ -78,12 +86,23 @@ def _sync(fd):
         os.fsync(fd)
 
 
-def signal_for(status_code, payload):
-    """The failure signal of a final outcome, or None. A 504 is a timeout whatever its body."""
-    if status_code == 504:
-        return "timeout"
-    status = (payload or {}).get("status") if isinstance(payload, dict) else None
-    return status if status in SIGNALS else None
+def signals_for(status_code, payload, reason_code=None):
+    """The failure signals of a final outcome, sorted; empty for none. A 504 is a timeout
+    and a 503 a model outage whatever their body. `incomplete` is a signal only for a
+    defect: an unverified answer raises none, and an `incomplete` with no known code is
+    treated as a defect (every verdict carries a code since C1b; a missing one is a bug
+    the loop should see)."""
+    status = payload.get("status") if isinstance(payload, dict) else None
+    found = set()
+    if status_code == 504 or status == "timeout":
+        found.add("timeout")
+    if status_code == 503 or status == "unavailable":
+        found.add("unavailable")
+    if status in ("withheld", "unclear", "malformed"):
+        found.add(status)
+    if status == "incomplete" and reason_code != UNVERIFIED:
+        found.add("incomplete")
+    return sorted(found)
 
 
 def _digest(text):
@@ -97,7 +116,9 @@ def _finite_number(value):
 def _valid_record(record, fid):
     """A complete stored failure: what capture() writes, with this id."""
     return (isinstance(record, dict) and record.get("id") == fid
-            and _finite_number(record.get("ts")) and record.get("signal") in SIGNALS
+            and _finite_number(record.get("ts"))
+            and isinstance(record.get("signals"), list) and record["signals"]
+            and all(isinstance(x, str) and x in SIGNALS for x in record["signals"])
             and isinstance(record.get("status_code"), int)
             and not isinstance(record.get("status_code"), bool)
             and "status" in record
@@ -207,19 +228,25 @@ class FailureStore:
             os.close(fd)
 
     # -- capture -----------------------------------------------------------------------
-    def capture(self, question, status_code, payload):
+    def capture(self, question, status_code, payload, reason_code=None):
         """Keep a failed question and its answer; return the failure id, or None when the
-        outcome raised no signal (nothing is written then). The intent is audited first:
-        if that fails, nothing is stored. The record is written under a temporary name and
-        renamed into place, so it is either complete or absent."""
-        signal = signal_for(status_code, payload)
-        if signal is None:
+        outcome raised no signal (nothing is written then; an unverified answer is only
+        counted). The intent is audited first: if that fails, nothing is stored. The record
+        is written under a temporary name and renamed into place, so it is either complete
+        or absent."""
+        signals = signals_for(status_code, payload, reason_code)
+        if not signals:
+            if (isinstance(payload, dict) and payload.get("status") == "incomplete"
+                    and reason_code == UNVERIFIED):
+                self._audit("unverified")      # a count: no id, no text, nothing stored
             return None
         now = self.clock()
         fid = "%d-%s" % (int(now), secrets.token_hex(4))
-        self._audit("capturing", id=fid, signal=signal, status_code=status_code,
+        self._audit("capturing", id=fid, signals=signals, status_code=status_code,
+                    reason_code=reason_code,
                     question_sha256=_digest(question), question_chars=len(question or ""))
-        record = {"id": fid, "ts": int(now), "signal": signal, "status_code": status_code,
+        record = {"id": fid, "ts": int(now), "signals": signals, "status_code": status_code,
+                  "reason_code": reason_code,
                   "status": payload.get("status") if isinstance(payload, dict) else None,
                   "question": question,
                   "answer": payload.get("answer", "") if isinstance(payload, dict) else ""}

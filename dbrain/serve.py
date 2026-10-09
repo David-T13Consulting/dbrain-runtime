@@ -38,9 +38,15 @@ import time
 import urllib.request
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from . import adapter as adapter_mod
 from . import answer, config, index, outpath, trace
+from . import failures as failures_mod
+
+# Payload key carrying the verdict's reason code from Service.ask to the capture point;
+# never sent to the phone.
+REASON_KEY = "_reason_code"
 
 TAILNET_NETS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
 KEYCHAIN_SERVICE = "dbrain-mvp-ask"
@@ -705,7 +711,7 @@ class Service:
     """Everything the handler needs, so tests can build one with a stub model."""
 
     def __init__(self, token, model_factory, profile=None, vault=None, limit=None,
-                 tracing=True, model_health=None, today=None):
+                 tracing=True, model_health=None, today=None, failures=None):
         if not token or len(token) < 32:
             raise ValueError("a bearer token of at least 32 characters is required")
         self._token = token.encode("utf-8")
@@ -718,6 +724,9 @@ class Service:
         self.deadline = REQUEST_TIMEOUT
         self.model_health = model_health or (lambda: None)
         self.today = today or today_local
+        # P2.7 step C2: a FailureStore, or None (capture off). Set only by main(), and only
+        # when the launcher turns capture on.
+        self.failures = failures
 
     def authorised(self, header):
         if not header or not header.startswith("Bearer "):
@@ -777,6 +786,20 @@ class Service:
             return self._timed_out()
         return box["result"]
 
+    def record_failure(self, question, status_code, payload, reason_code=None):
+        """P2.7: keep a failed question for the loop, once per request, at the outcome the
+        phone saw, with every signal it raised (failures.SIGNALS); an unverified answer is
+        only counted. Never affects the reply: called after it is sent, and any error here
+        is reported by its type only."""
+        if self.failures is None:
+            return None
+        try:
+            return self.failures.capture(question, status_code, payload, reason_code)
+        except Exception as exc:
+            sys.stderr.write("%s failure capture skipped: %s\n"
+                             % (time.strftime("%Y-%m-%dT%H:%M:%S"), type(exc).__name__))
+            return None
+
     def _timed_out(self):
         sys.stderr.write("%s ask exceeded the %g s deadline\n"
                          % (time.strftime("%Y-%m-%dT%H:%M:%S"), self.deadline))
@@ -816,6 +839,9 @@ class Service:
                 "reason": result.reason,
                 "answer": result.answer,
                 "citations": cites,
+                # For the capture point only: the handler removes it before the reply, so
+                # the phone's JSON is unchanged (P2.7 step C2).
+                REASON_KEY: result.reason_code,
             }
         except index.ProhibitedNote as exc:
             # AGENTS.md rules 2-3: client material (or conflicting labels) is a breach to stop
@@ -1018,9 +1044,14 @@ def make_handler(service):
                 return self._send(429, {"status": "busy",
                                         "reason": "one question at a time; try again shortly"})
             code, payload = service.ask_within(question, started)
+            payload = dict(payload)
+            reason_code = payload.pop(REASON_KEY, None)
             if code != 200:
                 payload = dict(payload, display=error_display(code))
             self._send(code, payload)
+            # Once per request, here and only here: a model worker that finishes after a
+            # 504 records nothing more (P2.7 step C2, the capture point).
+            service.record_failure(question, code, payload, reason_code)
 
     return Handler
 
@@ -1062,6 +1093,22 @@ def build_server(host, port, service):
     return _Server((host, port), make_handler(service))
 
 
+def setup_failures(service, env, store_factory=None, store_path=None):
+    """P2.7: capture is off unless the launcher turns it on (D110; the loop's go). Retention
+    is not tied to that switch: §7a's 90 days apply to every stored failure, so the sweep
+    runs whenever the store exists, even after capture is turned off again. Returns the
+    store whose retention was started, or None."""
+    store_factory = store_factory or failures_mod.FailureStore
+    store_path = Path(store_path or failures_mod.STORE)
+    capture_on = env.get("DBRAIN_FAILURE_CAPTURE") == "on"
+    if not (capture_on or store_path.exists()):
+        return None
+    store = store_factory()
+    store.start_retention()
+    service.failures = store if capture_on else None
+    return store
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="dbrain.serve", description=__doc__.split("\n")[0])
     ap.add_argument("--host", default=None, help="Tailscale address (default: from the Tailscale CLI)")
@@ -1087,6 +1134,7 @@ def main(argv=None):
         model_health=llama_health,
     )
     del bearer
+    setup_failures(service, os.environ)
     server = build_server(host, args.port, service)
     sys.stderr.write("%s dbrain-ask listening on http://%s:%d (profile %s)\n"
                      % (time.strftime("%Y-%m-%dT%H:%M:%S"), host, args.port, service.profile.name))

@@ -1,4 +1,4 @@
-"""P2.7 step C1: the failure store and its audit log, with planted data only.
+"""P2.7 steps C1 and C2: the failure store and its audit log, with planted data only.
 
 Everything runs in temporary folders: no real question is read or stored, and nothing is
 written under ~/Library/Application Support/dbrain.
@@ -12,10 +12,13 @@ import time
 import unittest
 from pathlib import Path
 
-from dbrain import failures, outpath
+from dbrain import adapter, answer, failures, outpath, serve
+from tests.test_serve import EndpointFixture
 
 PLANTED_Q = "PLANTED-Q-4e1d which bag does Zoe need on Friday"
 PLANTED_A = "PLANTED-A-9b77 the blue bag"
+# For the endpoint: no date in it, so the question reaches the (stub) model.
+PLANTED_EP = "What does tempo mean? plantedmarkerqx"
 
 
 class Clock:
@@ -53,7 +56,7 @@ class CaptureTest(StoreFixture):
         self.assertEqual(len(self.stored()), len(cases))
         self.assertEqual([e["event"] for e in self.audit_lines()],
                          ["capturing", "captured"] * len(cases))
-        self.assertEqual(sorted(e["signal"] for e in self.audit_lines() if e["event"] == "capturing"),
+        self.assertEqual(sorted(e["signals"][0] for e in self.audit_lines() if e["event"] == "capturing"),
                          sorted(["unclear", "incomplete", "withheld", "malformed",
                                  "unavailable", "timeout"]))
 
@@ -111,7 +114,7 @@ class ConcurrencyAndRecoveryTest(StoreFixture):
     def test_an_incomplete_record_is_not_reconciled_as_captured(self):
         self.store.capture(PLANTED_Q, 200, {"status": "withheld", "answer": ""})   # creates folder
         for name, body in (("1-a.json", '{"id": "1-a"}'),
-                           ("2-b.json", '{"id": "2-b", "ts": 1, "signal": "nope", "question": "", "answer": ""}')):
+                           ("2-b.json", '{"id": "2-b", "ts": 1, "signals": ["nope"], "question": "", "answer": ""}')):
             (self.home / "failures" / name).write_text(body)
             os.chmod(self.home / "failures" / name, 0o600)
         self.assertEqual(self.store.reconcile()["captured"], [])
@@ -180,7 +183,7 @@ class RoundFourRegressionTest(StoreFixture):
 
     def test_records_missing_status_fields_are_not_reconciled(self):
         self.store.capture(PLANTED_Q, 200, {"status": "withheld", "answer": ""})   # creates folder
-        base = {"ts": 1, "signal": "withheld", "question": "q", "answer": ""}
+        base = {"ts": 1, "signals": ["withheld"], "question": "q", "answer": ""}
         for fid, extra in (("1-a", {}), ("2-b", {"status_code": "200", "status": "x"}),
                            ("3-c", {"status_code": 200, "status": 5}),
                            ("4-d", {"status_code": True, "status": "x"}),
@@ -189,6 +192,97 @@ class RoundFourRegressionTest(StoreFixture):
             (self.home / "failures" / (fid + ".json")).write_text(json.dumps(rec))
             os.chmod(self.home / "failures" / (fid + ".json"), 0o600)
         self.assertEqual(self.store.reconcile()["captured"], [])
+
+
+class SignalTableTest(unittest.TestCase):
+    """One table (D113): which final outcomes are failures, and that unverified is not."""
+
+    def test_the_table(self):
+        cases = [
+            ((200, {"status": "withheld"}, "declined"), ["withheld"]),
+            ((200, {"status": "withheld"}, "no_evidence"), ["withheld"]),
+            ((200, {"status": "unclear"}, None), ["unclear"]),
+            ((504, {"status": "timeout"}, None), ["timeout"]),
+            ((504, {}, None), ["timeout"]),
+            ((503, {"status": "unavailable"}, None), ["unavailable"]),
+            ((200, {"status": "malformed"}, None), ["malformed"]),
+            ((200, {"status": "incomplete"}, answer.UNVERIFIED), []),
+            ((200, {"status": "incomplete"}, None), ["incomplete"]),       # no code: a defect
+            ((200, {"status": "supported"}, answer.VERIFIED), []),
+            ((423, {"status": "paused"}, None), []),
+            ((500, {"status": "error"}, None), []),
+        ]
+        for code in sorted(answer.DEFECTS):
+            cases.append(((200, {"status": "incomplete"}, code), ["incomplete"]))
+        for args, expected in cases:
+            with self.subTest(args=args):
+                self.assertEqual(failures.signals_for(*args), expected)
+
+    def test_every_signal_has_a_description(self):
+        self.assertEqual(set(failures.SIGNALS), {"withheld", "unclear", "timeout", "unavailable",
+                                                 "malformed", "incomplete"})
+        self.assertTrue(all(failures.SIGNALS.values()))
+
+
+class CountTest(StoreFixture):
+    def test_unverified_is_one_text_free_audit_line_and_nothing_stored(self):
+        self.assertIsNone(self.store.capture(PLANTED_Q, 200, {"status": "incomplete",
+                                                              "answer": PLANTED_A},
+                                             answer.UNVERIFIED))
+        self.assertEqual(self.stored(), [])
+        self.assertEqual([e["event"] for e in self.audit_lines()], ["unverified"])
+        self.assertEqual(set(self.audit_lines()[0]), {"ts", "event"})
+
+    def test_a_request_with_two_signals_is_captured_once_with_both(self):
+        fid = self.store.capture(PLANTED_Q, 504, {"status": "unavailable", "answer": ""})
+        self.assertEqual(len(self.stored()), 1)
+        events = self.audit_lines()
+        self.assertEqual([e["event"] for e in events], ["capturing", "captured"])
+        self.assertEqual(events[0]["signals"], ["timeout", "unavailable"])
+        record = json.loads((self.home / "failures" / (fid + ".json")).read_text())
+        self.assertEqual(record["signals"], ["timeout", "unavailable"])
+
+
+class SetupTest(unittest.TestCase):
+    """serve.setup_failures: capture behind its switch; retention whenever a store exists."""
+
+    class FakeStore:
+        started = 0
+
+        def start_retention(self):
+            SetupTest.FakeStore.started += 1
+
+    class FakeService:
+        failures = "unset"
+
+    def setUp(self):
+        SetupTest.FakeStore.started = 0
+        self.base = Path(tempfile.mkdtemp(prefix="dbrain-setup-"))
+
+    def run_setup(self, env, exists):
+        path = self.base / ("failures" if exists else "absent")
+        if exists:
+            path.mkdir()
+        svc = self.FakeService()
+        store = serve.setup_failures(svc, env, store_factory=self.FakeStore, store_path=path)
+        return svc, store
+
+    def test_capture_off_and_no_store_starts_nothing(self):
+        svc, store = self.run_setup({}, exists=False)
+        self.assertIsNone(store)
+        self.assertEqual(svc.failures, "unset")
+        self.assertEqual(self.FakeStore.started, 0)
+
+    def test_capture_off_with_an_existing_store_still_runs_retention(self):
+        svc, store = self.run_setup({}, exists=True)
+        self.assertIsNotNone(store)
+        self.assertIsNone(svc.failures)               # no capture
+        self.assertEqual(self.FakeStore.started, 1)   # but the 90-day sweep runs
+
+    def test_capture_on_captures_and_runs_retention(self):
+        svc, store = self.run_setup({"DBRAIN_FAILURE_CAPTURE": "on"}, exists=False)
+        self.assertIs(svc.failures, store)
+        self.assertEqual(self.FakeStore.started, 1)
 
 
 class RetentionTest(StoreFixture):
@@ -469,6 +563,115 @@ class BoundaryTest(unittest.TestCase):
         with self.assertRaises(outpath.OutsideVaultError):
             store.capture(PLANTED_Q, 200, {"status": "incomplete", "answer": ""})
         self.assertFalse((base / "failures").exists())
+
+
+class EndpointCaptureTest(EndpointFixture):
+    """The capture point: once per request, at the outcome the phone saw."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = Path(tempfile.mkdtemp(prefix="dbrain-failures-endpoint-"))
+        self.service.failures = failures.FailureStore(store=self.home / "failures",
+                                                      logs=self.home / "logs")
+
+    def captured(self):
+        path = self.home / "logs" / failures.AUDIT_NAME
+        for _ in range(50):                  # the capture runs just after the reply is sent
+            if path.exists() and '"captured"' in path.read_text():
+                break
+            time.sleep(0.02)
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def test_capture_is_off_unless_a_store_is_given(self):
+        self.service.failures = None
+        code, _ = self.request("POST", "/ask", {"question": PLANTED_EP})
+        self.assertEqual(code, 200)
+        self.assertFalse((self.home / "logs").exists())
+
+    def test_a_defect_is_captured_once_with_its_code(self):
+        self.model.reply = "Tempo means marathon pace or faster."          # no citation
+        code, body = self.request("POST", "/ask", {"question": PLANTED_EP})
+        self.assertEqual(body["status"], "incomplete")
+        events = self.captured()
+        self.assertEqual([e["event"] for e in events], ["capturing", "captured"])
+        self.assertEqual((events[0]["status_code"], events[0]["signals"], events[0]["reason_code"]),
+                         (code, ["incomplete"], "no_citation"))
+
+    def test_an_unverified_answer_is_counted_never_stored(self):
+        code, body = self.request("POST", "/ask", {"question": PLANTED_EP})   # cited, grounded
+        self.assertEqual((code, body["status"]), (200, "incomplete"))
+        path = self.home / "logs" / failures.AUDIT_NAME
+        for _ in range(50):
+            if path.exists():
+                break
+            time.sleep(0.02)
+        events = [json.loads(l) for l in path.read_text().splitlines()]
+        self.assertEqual(events, [{"event": "unverified", "ts": events[0]["ts"]}])
+        self.assertFalse((self.home / "failures").exists() and any((self.home / "failures").glob("*.json")))
+        self.assertNotIn("plantedmarkerqx", path.read_text())
+
+    def test_a_decline_and_an_unclear_date_are_captured(self):
+        self.model.reply = "The evidence does not say [E1]"
+        self.request("POST", "/ask", {"question": PLANTED_EP})
+        self.request("POST", "/ask", {"question": "What do I do on 31 February? plantedmarkerqx"})
+        path = self.home / "logs" / failures.AUDIT_NAME
+        for _ in range(50):
+            if path.exists() and path.read_text().count('"captured"') >= 2:
+                break
+            time.sleep(0.02)
+        signals = [e["signals"] for e in map(json.loads, path.read_text().splitlines())
+                   if e["event"] == "capturing"]
+        self.assertEqual(signals, [["withheld"], ["unclear"]])
+
+    def test_the_trace_counts_the_code_and_holds_no_text(self):
+        self.request("POST", "/ask", {"question": PLANTED_EP})
+        self.model.reply = "Tempo means marathon pace or faster."
+        self.request("POST", "/ask", {"question": PLANTED_EP})
+        self.captured()
+        traces = list(self.artifacts.glob("traces-*.jsonl"))
+        self.assertEqual(len(traces), 1)
+        text = traces[0].read_text()
+        self.assertEqual([json.loads(l)["reason_code"] for l in text.splitlines()],
+                         ["unverified", "no_citation"])
+        for planted in ("plantedmarkerqx", "marathon pace"):
+            self.assertNotIn(planted, text)
+        self.assertNotIn("plantedmarkerqx", (self.home / "logs" / failures.AUDIT_NAME).read_text())
+
+    def test_the_phone_never_sees_the_reason_code(self):
+        code, body = self.request("POST", "/ask", {"question": PLANTED_EP})
+        self.assertNotIn(serve.REASON_KEY, body)
+        self.assertNotIn("reason_code", body)
+
+    def test_a_late_worker_after_a_504_records_nothing_more(self):
+        release = threading.Event()
+
+        class Slow(adapter.StubAdapter):
+            def generate(self, prompt, max_tokens=320):
+                release.wait(5)
+                return super().generate(prompt, max_tokens)
+        self.service.model_factory = lambda: Slow(reply="Tempo means marathon pace [E1]")
+        self.service.deadline = 0.5
+        code, body = self.request("POST", "/ask", {"question": PLANTED_EP})
+        self.assertEqual((code, body["status"]), (504, "timeout"))
+        release.set()
+        time.sleep(0.5)                       # let the worker finish after the 504
+        events = self.captured()
+        self.assertEqual([(e["event"], e.get("signals")) for e in events],
+                         [("capturing", ["timeout"]), ("captured", None)])
+
+    def test_refused_requests_are_not_captured(self):
+        self.assertEqual(self.request("POST", "/ask", {"question": ""})[0], 400)
+        self.assertEqual(self.request("POST", "/ask", {"question": PLANTED_EP}, token="x" * 40)[0], 401)
+        self.assertFalse((self.home / "logs").exists())
+
+    def test_a_capture_error_never_changes_the_reply(self):
+        class Broken:
+            def capture(self, *a):
+                raise RuntimeError("disk full")
+        self.service.failures = Broken()
+        code, body = self.request("POST", "/ask", {"question": PLANTED_EP})
+        self.assertEqual(code, 200)
+        self.assertIn(body["status"], ("incomplete", "withheld"))
 
 
 if __name__ == "__main__":

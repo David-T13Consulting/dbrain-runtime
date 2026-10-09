@@ -27,6 +27,9 @@ def write(result, model, profile, artifacts=None):
         "profile": profile.name,
         "status": result.status,
         "reason": result.reason,
+        # A fixed code (P2.7 step C1b/C2, D113): lets the trace count unverified answers
+        # apart from defects without any question or answer text.
+        "reason_code": getattr(result, "reason_code", None),
         "grounding_overlap": result.grounding,
         # Everything the query actually opened. Recording only the retrieved hits
         # understated this: indexing reads every allowed note, including on a withheld
