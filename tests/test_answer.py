@@ -66,6 +66,77 @@ class VerdictTest(unittest.TestCase):
         self.assertNotIn("Read-only unless asked", prompt)  # vault-root AGENTS.md
 
 
+class ReasonCodeTest(unittest.TestCase):
+    """P2.7 step C1b (D113): every verdict carries a fixed reason code, so a cited and
+    grounded but unverified answer is told apart from a real defect. Status and readable
+    reason stay exactly as before."""
+
+    def setUp(self):
+        self.vault, _, _ = fake_vault.build()
+        self.profile = fake_vault.PROFILE
+
+    def ask(self, reply=None, question="What does tempo mean?", verifier=None):
+        return answer.ask(question, profile=self.profile, vault=self.vault,
+                          model=adapter.StubAdapter(reply=reply), verifier=verifier)
+
+    def test_each_path_gets_its_code_and_keeps_its_status(self):
+        cases = [
+            (dict(question="What is the capital of France?"), answer.WITHHELD, answer.NO_EVIDENCE),
+            (dict(reply="The evidence does not say [E1]"), answer.WITHHELD, answer.DECLINED),
+            (dict(reply="Says so [E1] and also [E99]"), answer.INCOMPLETE, answer.INVALID_CITATION),
+            (dict(reply="Marathon pace or faster."), answer.INCOMPLETE, answer.NO_CITATION),
+            (dict(reply="The moon is made of cheese [E1]"), answer.INCOMPLETE, answer.LOW_GROUNDING),
+            (dict(reply="Tempo means marathon pace or faster [E1]"), answer.INCOMPLETE, answer.UNVERIFIED),
+            (dict(reply="Tempo means marathon pace or faster [E1]", verifier=lambda t, c: False),
+             answer.INCOMPLETE, answer.VERIFIER_REJECTED),
+            (dict(reply="Tempo means marathon pace or faster [E1]", verifier=lambda t, c: True),
+             answer.SUPPORTED, answer.VERIFIED),
+        ]
+        for kwargs, status, code in cases:
+            with self.subTest(code=code):
+                result = self.ask(**kwargs)
+                self.assertEqual((result.status, result.reason_code), (status, code))
+                self.assertIsInstance(result.reason_code, str)
+
+    def test_the_codes_are_these_literal_strings(self):
+        """The codes are a contract with the capture step (C2) and the audit counts: pin
+        them as literals, not through the constants they are compared with."""
+        self.assertEqual(
+            (answer.NO_EVIDENCE, answer.DECLINED, answer.INVALID_CITATION, answer.NO_CITATION,
+             answer.LOW_GROUNDING, answer.UNVERIFIED, answer.VERIFIER_REJECTED,
+             answer.VERIFIED, answer.MODEL_UNAVAILABLE),
+            ("no_evidence", "declined", "invalid_citation", "no_citation", "low_grounding",
+             "unverified", "verifier_rejected", "verified", "model_unavailable"))
+        self.assertEqual(self.ask(reply="The evidence does not say [E1]").reason_code, "declined")
+        self.assertEqual(self.ask(reply="Tempo means marathon pace or faster [E1]").reason_code,
+                         "unverified")
+
+    def test_unverified_is_not_a_defect_and_the_real_defects_are(self):
+        self.assertNotIn(answer.UNVERIFIED, answer.DEFECTS)
+        self.assertEqual(answer.DEFECTS, {answer.INVALID_CITATION, answer.NO_CITATION,
+                                          answer.LOW_GROUNDING, answer.VERIFIER_REJECTED})
+
+    def test_the_readable_reason_is_unchanged(self):
+        """The phone's status line is derived from the readable reason (serve.plain_status),
+        so the reason text must stay what it was."""
+        self.assertIn("entailment unverified",
+                      self.ask(reply="Tempo means marathon pace or faster [E1]").reason)
+        self.assertEqual(self.ask(reply="Marathon pace or faster.").reason,
+                         "answered without citing any evidence")
+        self.assertEqual(self.ask(reply="Says so [E1] and also [E99]").reason,
+                         "cited an id that was never offered: E99")
+
+    def test_a_model_outage_carries_its_code_on_the_partial_result(self):
+        class Down(adapter.StubAdapter):
+            def generate(self, prompt, max_tokens=320):
+                raise adapter.ModelUnavailable("down")
+        with self.assertRaises(adapter.ModelUnavailable) as ctx:
+            answer.ask("What does tempo mean?", profile=self.profile, vault=self.vault,
+                       model=Down())
+        self.assertEqual((ctx.exception.partial.status, ctx.exception.partial.reason_code),
+                         (answer.FAILED, answer.MODEL_UNAVAILABLE))
+
+
 class GroundingTest(unittest.TestCase):
     """A valid citation alone must not earn `supported`: the earlier version classified
     "The moon is made of cheese [E1]" as supported, which is the failure this guards."""

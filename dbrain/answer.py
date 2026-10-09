@@ -26,6 +26,23 @@ SUPPORTED, INCOMPLETE, WITHHELD = "supported", "incomplete", "withheld"
 # CLI fails loudly instead.
 FAILED = "failed"
 
+# Why a verdict was given, as a fixed code next to the readable `reason` (P2.7 step C1b,
+# D113). `incomplete` covers two different things until a verifier exists: an answer that
+# cited real evidence and stays on it but whose entailment nobody checked (UNVERIFIED),
+# and a real defect. Only the defects, with the other failure signals, may store a
+# question (P2.7 step C2); UNVERIFIED is counted, never stored. The status and the text
+# the phone shows do not change.
+NO_EVIDENCE = "no_evidence"              # withheld before the model: nothing retrieved
+DECLINED = "declined"                    # withheld: the model said the notes don't say
+INVALID_CITATION = "invalid_citation"    # incomplete: cited an id never offered
+NO_CITATION = "no_citation"              # incomplete: answered without citing
+LOW_GROUNDING = "low_grounding"          # incomplete: wording strays from the evidence
+UNVERIFIED = "unverified"                # incomplete: cited and grounded, no verifier
+VERIFIER_REJECTED = "verifier_rejected"  # incomplete: a verifier said unsupported
+VERIFIED = "verified"                    # supported
+MODEL_UNAVAILABLE = "model_unavailable"  # failed (trace only): no reply from the model
+DEFECTS = frozenset({INVALID_CITATION, NO_CITATION, LOW_GROUNDING, VERIFIER_REJECTED})
+
 PROMPT = """You answer only from the evidence below, about David's own notes.
 
 Rules:
@@ -43,7 +60,7 @@ Answer (with [En] citations):"""
 
 # Phrases with which a model declines. If it says it cannot answer, the service must not
 # dress that up as an answer just because a citation is attached.
-DECLINED = (
+DECLINE_PHRASES = (
     "insufficient evidence", "no evidence", "not enough evidence", "cannot answer",
     "can't answer", "unable to answer", "does not say", "doesn't say", "not stated",
     "not specified", "no information", "i don't know", "i do not know",
@@ -67,7 +84,7 @@ GROUNDING_THRESHOLD = 0.15
 
 def _declines(text):
     low = text.lower()
-    return any(phrase in low for phrase in DECLINED)
+    return any(phrase in low for phrase in DECLINE_PHRASES)
 
 
 def grounding_overlap(answer_text, cited_chunks):
@@ -87,7 +104,7 @@ def grounding_overlap(answer_text, cited_chunks):
 
 class Result:
     def __init__(self, question, status, answer, citations, hits, timing=None, invalid=(),
-                 files=None, grounding=None, reason=None, skipped=None):
+                 files=None, grounding=None, reason=None, skipped=None, reason_code=None):
         self.question = question
         self.status = status
         self.answer = answer
@@ -98,6 +115,7 @@ class Result:
         self.files = files or {}          # every note indexed for this query
         self.grounding = grounding        # overlap score, or None if not computed
         self.reason = reason              # why this verdict, in one phrase
+        self.reason_code = reason_code    # the same, as one of the codes above
         self.skipped = list(skipped or [])  # (path, reason): read, refused by the label rules, never indexed
 
     def render(self):
@@ -143,7 +161,7 @@ def ask(question, profile=None, model=None, vault=None, limit=4, verifier=None, 
             [],
             [],
             files=files, skipped=skipped,
-            reason="no evidence retrieved",
+            reason="no evidence retrieved", reason_code=NO_EVIDENCE,
         )
 
     model = model or adapter_mod.LlamaCppAdapter()
@@ -165,7 +183,7 @@ def ask(question, profile=None, model=None, vault=None, limit=4, verifier=None, 
         # trace gets the exception class only, never remote text.
         exc.partial = Result(
             question, FAILED, "", [], hits, {}, (), files=files, skipped=skipped,
-            reason=type(exc).__name__,
+            reason=type(exc).__name__, reason_code=MODEL_UNAVAILABLE,
         )
         raise
 
@@ -184,28 +202,30 @@ def ask(question, profile=None, model=None, vault=None, limit=4, verifier=None, 
 
     if _declines(text):
         # The model itself said it could not answer. Report that, not a false positive.
-        status, reason = WITHHELD, "the model declined on the available evidence"
+        status, code, reason = WITHHELD, DECLINED, "the model declined on the available evidence"
     elif invalid:
-        status, reason = INCOMPLETE, "cited an id that was never offered: %s" % ", ".join(invalid)
+        status, code, reason = INCOMPLETE, INVALID_CITATION, (
+            "cited an id that was never offered: %s" % ", ".join(invalid))
     elif not cited:
-        status, reason = INCOMPLETE, "answered without citing any evidence"
+        status, code, reason = INCOMPLETE, NO_CITATION, "answered without citing any evidence"
     elif overlap < GROUNDING_THRESHOLD:
         # Cited something real, but the answer is largely not about it.
-        status, reason = INCOMPLETE, (
+        status, code, reason = INCOMPLETE, LOW_GROUNDING, (
             "only %.0f%% of the answer's wording appears in the evidence it cited "
             "(threshold %.0f%%)" % (overlap * 100, GROUNDING_THRESHOLD * 100)
         )
     elif verifier is None:
         # Grounding is necessary but not sufficient. No entailment check is available,
         # so support is not claimed. See the module docstring.
-        status, reason = INCOMPLETE, (
+        status, code, reason = INCOMPLETE, UNVERIFIED, (
             "grounded (%.0f%% lexical overlap) but entailment unverified: no verifier "
             "is available, so support is not claimed" % (overlap * 100)
         )
     elif not verifier(text, cited_chunks):
-        status, reason = INCOMPLETE, "a verifier rejected the answer as unsupported"
+        status, code, reason = INCOMPLETE, VERIFIER_REJECTED, (
+            "a verifier rejected the answer as unsupported")
     else:
-        status, reason = SUPPORTED, (
+        status, code, reason = SUPPORTED, VERIFIED, (
             "cited evidence, %.0f%% lexical overlap, entailment confirmed" % (overlap * 100)
         )
 
@@ -219,5 +239,5 @@ def ask(question, profile=None, model=None, vault=None, limit=4, verifier=None, 
         invalid,
         files=files, skipped=skipped,
         grounding=round(overlap, 3),
-        reason=reason,
+        reason=reason, reason_code=code,
     )
