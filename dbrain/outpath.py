@@ -84,13 +84,39 @@ def assert_outside_vault(path, vault=None):
     return target
 
 
-def _open_dir_anchored(directory, vault=None):
+def assert_outside_git(path):
+    """Refuse a destination inside a git working tree (data policy §7a and §7b: the
+    failure store and its logs live outside git). Walks the real path upwards looking for
+    a `.git` entry; a git-ignored folder inside a repository is still inside git."""
+    target = _real(path)
+    for p in [target] + list(target.parents):
+        if os.path.lexists(str(p / ".git")):
+            raise OutsideVaultError(
+                "refusing to write inside a git working tree: %s is under %s" % (path, p))
+    return target
+
+
+def _has_git(fd):
+    """A `.git` entry (directory, or file as in a worktree) in the directory open at fd."""
+    try:
+        os.stat(".git", dir_fd=fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _open_dir_anchored(directory, vault=None, outside_git=False, private=False):
     """Walk an absolute, already-real directory path with O_NOFOLLOW, creating as needed.
     Every directory opened on the way is compared with the vault by identity, so no
-    alias or case variant can walk the write into it."""
+    alias or case variant can walk the write into it. With `outside_git`, every directory
+    on the same descriptor chain is also checked for a `.git` entry, so the check and the
+    write cannot be separated by a path change. With `private`, the last directory must be
+    owned by this user with no group or other access (P2.7 failure store and its logs)."""
     vid = _vault_identity(vault)
     fd = os.open("/", os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
     try:
+        if outside_git and _has_git(fd):
+            raise OutsideVaultError("refusing to write inside a git working tree (/)")
         for part in directory.parts[1:]:
             flags = os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW
             try:
@@ -106,6 +132,13 @@ def _open_dir_anchored(directory, vault=None):
             st = os.fstat(fd)
             if (st.st_dev, st.st_ino) == vid:
                 raise OutsideVaultError("refusing to write under the vault (reached as %s)" % directory)
+            if outside_git and _has_git(fd):
+                raise OutsideVaultError("refusing to write inside a git working tree (%s)" % directory)
+        if private:
+            st = os.fstat(fd)
+            if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+                raise OutsideVaultError("refusing %s: not private to this user (mode %o)"
+                                        % (directory, stat.S_IMODE(st.st_mode)))
         return fd
     except OutsideVaultError:
         os.close(fd)
@@ -123,15 +156,33 @@ def _open_dir_anchored(directory, vault=None):
         raise
 
 
-def open_for_write(path, vault=None, append=False):
+def _strict_real(path, vault=None, strict=False):
+    """assert_outside_vault, and with `strict` the path must already be its own real path:
+    a caller that resolved it earlier refuses a symlink swapped in since, instead of
+    following it to wherever it now points (P2.7 store and logs)."""
+    target = assert_outside_vault(path, vault)
+    if strict and target != Path(os.path.abspath(str(path))):
+        raise OutsideVaultError("refusing %s: it now resolves elsewhere (a symlink?)" % path)
+    return target
+
+
+def open_dir_guarded(path, vault=None, outside_git=False, private=False, strict=False):
+    """A descriptor for a guarded directory (created if missing), for callers that list,
+    read and delete inside it relative to that descriptor (P2.7 retention)."""
+    target = _strict_real(path, vault, strict)
+    return _open_dir_anchored(target, vault, outside_git=outside_git, private=private)
+
+
+def open_for_write(path, vault=None, append=False, outside_git=False, private=False,
+                   strict=False):
     """Open a guarded destination, refusing to write through a symlink at any depth.
 
     Missing parent directories are created inside the same anchored walk, so callers
     must not `mkdir` the destination themselves: a pre-created path would be followed
     through whatever it had become by then.
     """
-    target = assert_outside_vault(path, vault)
-    dir_fd = _open_dir_anchored(target.parent, vault)
+    target = _strict_real(path, vault, strict)
+    dir_fd = _open_dir_anchored(target.parent, vault, outside_git=outside_git, private=private)
     # No O_TRUNC here: truncating at open would change the file before the link check
     # below could refuse it. Truncation happens on the checked descriptor instead.
     flags = os.O_WRONLY | os.O_CREAT | O_NOFOLLOW
@@ -148,6 +199,11 @@ def open_for_write(path, vault=None, append=False):
         os.close(dir_fd)
     try:
         _refuse_shared_inode(fd, target)
+        if private:
+            st = os.fstat(fd)
+            if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+                raise OutsideVaultError("refusing %s: not private to this user (mode %o)"
+                                        % (target, stat.S_IMODE(st.st_mode)))
         if not append:
             os.ftruncate(fd, 0)
     except BaseException:
