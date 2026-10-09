@@ -29,6 +29,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import socket
@@ -36,6 +37,7 @@ import sys
 import threading
 import time
 import urllib.request
+from collections import OrderedDict
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -55,6 +57,26 @@ MAX_QUESTION = 500
 DEFAULT_PORT = 8765
 REQUEST_TIMEOUT = 120
 TAILSCALE_CLIS = ("tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+
+# P2.7 step C5, the phone's one-tap "wrong" (data policy v0.8 §7a, D123): each recent
+# answer's text is held in this process's memory only, never on disk, for at most
+# RECENT_HOLD seconds. A tap is accepted for RECENT_WINDOW; the sweeper runs every
+# RECENT_SWEEP and drops anything that old, so nothing is held past RECENT_HOLD while the
+# Mac is awake (a sleeping Mac runs nothing; the first sweep after waking drops it).
+RECENT_HOLD = 3600
+RECENT_SWEEP = 15
+RECENT_WINDOW = RECENT_HOLD - RECENT_SWEEP
+RECENT_MAX = 64                       # answers held at once; the oldest is dropped first
+ANSWER_ID = re.compile(r"[0-9a-f]{32}")
+WRONG_SIGNAL = "user_wrong"
+# /wrong replies: fixed text, chosen by outcome only, never by what the phone sent.
+WRONG_REPLIES = {
+    "recorded": "Marked wrong. It is kept on this Mac for the weekly review.",
+    "repeat": "Already marked wrong.",
+    "unknown": "Too late to mark this answer: it is over an hour old, or the service restarted.",
+    "off": "Marking answers wrong is switched off on this Mac.",
+    "error": "Could not mark it wrong; try again.",
+}
 
 
 class BindRefused(Exception):
@@ -707,6 +729,127 @@ def _renumber(answer_text, label_to_n):
     return re.sub(r"\s+(?=\[E\d+\])", " ", CITE_ID.sub(sub, answer_text)).replace("  ", " ").strip()
 
 
+class _Recent:
+    """One answer the phone saw. Its text is set only while capture is on and nothing has
+    stored the answer yet. The text is read and changed only under the table's lock, held
+    for a few lines and never across I/O, so expiry and eviction drop it at once, whatever
+    else is running. `lock` orders the automatic capture and a tap: the handler holds it
+    from before the reply until its capture is settled, so a tap waits and sees the
+    outcome (a failure id, or the text to capture)."""
+    __slots__ = ("lock", "answer_id", "wall", "mono", "question", "answer", "status",
+                 "status_code", "reason_code", "failure_id", "tapped", "dropped")
+
+    def __init__(self, answer_id, wall, mono):
+        self.lock = threading.Lock()
+        self.answer_id, self.wall, self.mono = answer_id, wall, mono
+        self.question = self.answer = self.status = self.status_code = self.reason_code = None
+        self.failure_id = None
+        self.tapped = self.dropped = False
+
+    def drop(self):
+        self.question = self.answer = None
+        self.dropped = True
+
+
+class RecentAnswers:
+    """The in-memory table behind the "wrong" tap (P2.7 step C5, §7a v0.8). Bounded in
+    number and in age; nothing here is ever written anywhere. Age is the larger of the wall
+    clock's and the monotonic clock's, so neither a clock set back nor time the monotonic
+    clock does not count can extend the hold. Every read or change of an entry's text
+    happens under `_lock` and checks the age again, so text is never kept, set or handed
+    out past the window."""
+
+    def __init__(self, capacity=RECENT_MAX, window=RECENT_WINDOW, clock=time.time,
+                 monotonic=time.monotonic):
+        self.capacity, self.window = capacity, window
+        self.clock, self.monotonic = clock, monotonic
+        self._lock = threading.Lock()
+        self._items = OrderedDict()
+
+    def __len__(self):
+        with self._lock:
+            return len(self._items)
+
+    def _live(self, entry):
+        """Under _lock: the entry is in the table and inside the window. An entry found
+        past the window is dropped here and then."""
+        if entry.dropped or self._items.get(entry.answer_id) is not entry:
+            return False
+        if max(self.clock() - entry.wall, self.monotonic() - entry.mono) >= self.window:
+            del self._items[entry.answer_id]
+            entry.drop()
+            return False
+        return True
+
+    def open(self, answer_id):
+        """A new entry, returned with its lock held (the caller settles and releases it)."""
+        entry = _Recent(answer_id, self.clock(), self.monotonic())
+        entry.lock.acquire()
+        with self._lock:
+            self._items[answer_id] = entry
+            while len(self._items) > self.capacity:
+                self._items.popitem(last=False)[1].drop()
+        return entry
+
+    def settle(self, entry, question, answer, status_code, status, reason_code, failure_id):
+        """Record the automatic capture's outcome. The text is kept only if nothing stored
+        the answer and the entry is still live."""
+        with self._lock:
+            entry.status_code, entry.status, entry.reason_code = status_code, status, reason_code
+            entry.failure_id = failure_id
+            if failure_id is None and self._live(entry):
+                entry.question, entry.answer = question, answer
+
+    def get(self, answer_id):
+        """The entry for this id if it is still inside the window, else None."""
+        with self._lock:
+            entry = self._items.get(answer_id)
+            return entry if entry is not None and self._live(entry) else None
+
+    def claim(self, entry):
+        """A tap, under the entry's lock: 'unknown' if the entry has expired or gone,
+        'repeat' if it was tapped, else a snapshot (failure_id, question, answer, status,
+        status_code, reason_code). Claiming marks it tapped and drops its text from the
+        table; release() undoes that if storing the tap failed."""
+        with self._lock:
+            if not self._live(entry):
+                return "unknown"
+            if entry.tapped:
+                return "repeat"
+            snap = (entry.failure_id, entry.question, entry.answer, entry.status,
+                    entry.status_code, entry.reason_code)
+            entry.tapped = True
+            entry.question = entry.answer = None
+            return snap
+
+    def release(self, entry, snap):
+        """Storing a claimed tap failed: let the phone try again while the entry is live."""
+        with self._lock:
+            entry.tapped = False
+            if snap[0] is None and self._live(entry):
+                entry.question, entry.answer = snap[1], snap[2]
+
+    def sweep(self):
+        """Drop every entry at or past the window; returns how many were dropped. Never
+        waits for an entry's lock."""
+        with self._lock:
+            entries = list(self._items.values())
+            return sum(1 for e in entries if not self._live(e))
+
+    def start_sweeper(self, interval=RECENT_SWEEP):
+        def loop():
+            while True:
+                time.sleep(interval)
+                try:
+                    self.sweep()
+                except Exception as exc:
+                    sys.stderr.write("%s recent-answer sweep failed: %s\n"
+                                     % (time.strftime("%Y-%m-%dT%H:%M:%S"), type(exc).__name__))
+        t = threading.Thread(target=loop, name="dbrain-recent-sweep", daemon=True)
+        t.start()
+        return t
+
+
 class Service:
     """Everything the handler needs, so tests can build one with a stub model."""
 
@@ -727,6 +870,8 @@ class Service:
         # P2.7 step C2: a FailureStore, or None (capture off). Set only by main(), and only
         # when the launcher turns capture on.
         self.failures = failures
+        # P2.7 step C5: recent answers for a "wrong" tap, in memory only (§7a v0.8).
+        self.recent = RecentAnswers()
 
     def authorised(self, header):
         if not header or not header.startswith("Bearer "):
@@ -759,7 +904,7 @@ class Service:
         result.answer = _renumber(result.answer or "", label_to_n)
         return out
 
-    def ask_within(self, question, started):
+    def ask_within(self, question, started, answer_id=None):
         """`ask` under the end-to-end deadline (step 5): `started` is when the request
         arrived (time.monotonic). The caller holds `busy`; the worker releases it when the
         model call really ends, which may be after the phone got its 504."""
@@ -770,7 +915,7 @@ class Service:
 
         def work():
             try:
-                box["result"] = self.ask(question)
+                box["result"] = self.ask(question, answer_id=answer_id)
             except Exception as exc:  # never a blank screen on the phone
                 sys.stderr.write("%s ask failed: %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"),
                                                          type(exc).__name__))
@@ -786,7 +931,7 @@ class Service:
             return self._timed_out()
         return box["result"]
 
-    def record_failure(self, question, status_code, payload, reason_code=None):
+    def record_failure(self, question, status_code, payload, reason_code=None, answer_id=None):
         """P2.7: keep a failed question for the loop, once per request, at the outcome the
         phone saw, with every signal it raised (failures.SIGNALS); an unverified answer is
         only counted. Never affects the reply: called after it is sent, and any error here
@@ -794,18 +939,75 @@ class Service:
         if self.failures is None:
             return None
         try:
-            return self.failures.capture(question, status_code, payload, reason_code)
+            if answer_id is None:
+                return self.failures.capture(question, status_code, payload, reason_code)
+            return self.failures.capture(question, status_code, payload, reason_code,
+                                         answer_id=answer_id)
         except Exception as exc:
             sys.stderr.write("%s failure capture skipped: %s\n"
                              % (time.strftime("%Y-%m-%dT%H:%M:%S"), type(exc).__name__))
             return None
+
+    def remember(self, answer_id, question, status_code, payload, reason_code):
+        """The capture point (P2.7 steps C2 and C5), called by the handler with the reply
+        it is about to send. Returns a callable that sends nothing itself: the handler
+        sends the reply, then calls it to capture and settle. While capture is off nothing
+        is held: no entry, no text."""
+        if self.failures is None:
+            return lambda: self.record_failure(question, status_code, payload, reason_code)
+        entry = self.recent.open(answer_id)
+
+        def settle():
+            fid = None
+            try:
+                fid = self.record_failure(question, status_code, payload, reason_code,
+                                          answer_id=answer_id)
+            finally:
+                try:
+                    self.recent.settle(entry, question, payload.get("answer", ""), status_code,
+                                       payload.get("status"), reason_code, fid)
+                finally:
+                    entry.lock.release()
+        return settle
+
+    def mark_wrong(self, answer_id):
+        """A tap on the phone: an outcome key of WRONG_REPLIES. The first tap on an answer
+        still inside its hour captures it with `user_wrong` (or, if it is stored already,
+        adds that signal by one audit line); its text leaves the table when the tap is
+        claimed. Nothing else stores anything."""
+        if self.failures is None:
+            return "off"
+        entry = self.recent.get(answer_id)
+        if entry is None:
+            return "unknown"
+        with entry.lock:
+            snap = self.recent.claim(entry)       # the age is checked again, under the lock
+            if isinstance(snap, str):
+                return snap
+            fid, question, answer_text, status, status_code, reason_code = snap
+            try:
+                if fid is not None:
+                    if not self.failures.add_signal(fid, WRONG_SIGNAL, answer_id=answer_id):
+                        return "unknown"          # deleted since: nothing to mark
+                elif question is None:
+                    return "unknown"
+                else:
+                    entry.failure_id = self.failures.capture(
+                        question, status_code, {"status": status, "answer": answer_text or ""},
+                        reason_code, added=(WRONG_SIGNAL,), answer_id=answer_id)
+            except Exception as exc:
+                self.recent.release(entry, snap)
+                sys.stderr.write("%s wrong tap not recorded: %s\n"
+                                 % (time.strftime("%Y-%m-%dT%H:%M:%S"), type(exc).__name__))
+                return "error"
+            return "recorded"
 
     def _timed_out(self):
         sys.stderr.write("%s ask exceeded the %g s deadline\n"
                          % (time.strftime("%Y-%m-%dT%H:%M:%S"), self.deadline))
         return 504, {"status": "timeout", "reason": "no answer within %g s" % self.deadline}
 
-    def ask(self, question):
+    def ask(self, question, answer_id=None):
         started = time.time()
         model = self.model_factory()
         status_code = 200
@@ -867,7 +1069,7 @@ class Service:
         payload["display"] = display_text(payload)
         if self.tracing and result is not None:
             try:
-                trace.write(result, model, self.profile)
+                trace.write(result, model, self.profile, answer_id=answer_id)
             except outpath.OutsideVaultError:
                 pass  # the guard refused; the answer is still returned, nothing is written
         return status_code, payload
@@ -888,7 +1090,7 @@ def make_handler(service):
             method = getattr(self, "command", None)
             method = method if method in ("GET", "POST") else "OTHER"
             path = (getattr(self, "path", "") or "").split("?", 1)[0]
-            route = path if path in ("/ask", "/health") else "OTHER"
+            route = path if path in ("/ask", "/health", "/wrong") else "OTHER"
             return method, route
 
         def _log(self, event, code=None):
@@ -1011,23 +1213,56 @@ def make_handler(service):
             self._send(200, {"ok": True, "model": service.model_health(),
                              "busy": service.busy.locked()})
 
+        def _authorised_body(self, started):
+            """The checks /ask and /wrong share: token, length, body under the deadline.
+            The raw body, or None once a refusal has been sent."""
+            if not service.authorised(self.headers.get("Authorization")):
+                self._send(401, {"status": "unauthorised"})
+                return None
+            try:
+                length = int(self.headers.get("Content-Length", ""))
+            except ValueError:
+                self._send(411, {"status": "length required"})
+                return None
+            if length <= 0 or length > MAX_BODY:
+                self._send(413, {"status": "too large", "reason": "max %d bytes" % MAX_BODY})
+                return None
+            raw = self._read_body(length, started)
+            if raw is None:  # the deadline runs from arrival, body reading included
+                self._send(*service._timed_out())
+            return raw
+
+        def _wrong(self, started):
+            """POST /wrong {"id": "<answer_id>"} (P2.7 step C5). Only that one key, only an
+            id of the form /ask hands out; anything else is refused with a fixed reply and
+            nothing is stored or logged from it."""
+            raw = self._authorised_body(started)
+            if raw is None:
+                return
+            try:
+                body = json.loads(raw.decode("utf-8"))
+                if not (isinstance(body, dict) and set(body) == {"id"}
+                        and isinstance(body["id"], str) and ANSWER_ID.fullmatch(body["id"])):
+                    raise ValueError
+            except (ValueError, UnicodeDecodeError):
+                self._log("wrong-refused")
+                return self._send(400, {"status": "bad request",
+                                        "reason": 'send JSON: {"id": "<answer_id>"}'})
+            outcome = service.mark_wrong(body["id"])
+            self._log("wrong-" + outcome)
+            self._send(200, {"status": outcome, "display": WRONG_REPLIES[outcome]})
+
         def do_POST(self):
             started = self.arrived
             if not self._peer_ok():
                 return
+            if self.path == "/wrong":
+                return self._wrong(started)
             if self.path != "/ask":
                 return self._send(404, {"status": "not found"})
-            if not service.authorised(self.headers.get("Authorization")):
-                return self._send(401, {"status": "unauthorised"})
-            try:
-                length = int(self.headers.get("Content-Length", ""))
-            except ValueError:
-                return self._send(411, {"status": "length required"})
-            if length <= 0 or length > MAX_BODY:
-                return self._send(413, {"status": "too large", "reason": "max %d bytes" % MAX_BODY})
-            raw = self._read_body(length, started)
-            if raw is None:  # the deadline runs from arrival, body reading included
-                return self._send(*service._timed_out())
+            raw = self._authorised_body(started)
+            if raw is None:
+                return
             try:
                 body = json.loads(raw.decode("utf-8"))
                 question = body["question"]
@@ -1043,15 +1278,22 @@ def make_handler(service):
             if not service.busy.acquire(blocking=False):
                 return self._send(429, {"status": "busy",
                                         "reason": "one question at a time; try again shortly"})
-            code, payload = service.ask_within(question, started)
+            # A random id per answer (P2.7 step C5), not derived from the question: the
+            # phone sends it back to mark this answer wrong; the trace records it too.
+            answer_id = secrets.token_hex(16)
+            code, payload = service.ask_within(question, started, answer_id)
             payload = dict(payload)
             reason_code = payload.pop(REASON_KEY, None)
             if code != 200:
                 payload = dict(payload, display=error_display(code))
-            self._send(code, payload)
-            # Once per request, here and only here: a model worker that finishes after a
-            # 504 records nothing more (P2.7 step C2, the capture point).
-            service.record_failure(question, code, payload, reason_code)
+            payload["answer_id"] = answer_id
+            # Once per request, here and only here, from the outcome the phone sees: a model
+            # worker that finishes after a 504 records nothing more (P2.7 steps C2, C5).
+            settle = service.remember(answer_id, question, code, payload, reason_code)
+            try:
+                self._send(code, payload)
+            finally:
+                settle()
 
     return Handler
 
@@ -1106,6 +1348,8 @@ def setup_failures(service, env, store_factory=None, store_path=None):
     store = store_factory()
     store.start_retention()
     service.failures = store if capture_on else None
+    if capture_on:
+        service.recent.start_sweeper()   # §7a v0.8: no recent answer outlives RECENT_HOLD
     return store
 
 

@@ -14,7 +14,7 @@ from . import adapter as adapter_mod
 from . import config, outpath
 
 
-def write(result, model, profile, artifacts=None):
+def write(result, model, profile, artifacts=None, answer_id=None):
     root = Path(artifacts or config.LOGS)
     outpath.assert_outside_vault(root)
     outpath.assert_outside_git(root)
@@ -32,6 +32,9 @@ def write(result, model, profile, artifacts=None):
         # A fixed code (P2.7 step C1b/C2, D113): lets the trace count unverified answers
         # apart from defects without any question or answer text.
         "reason_code": getattr(result, "reason_code", None),
+        # The random id the phone got with this answer (P2.7 step C5): ties a "wrong" tap
+        # in the audit log to this line. Not derived from the question; None outside /ask.
+        "answer_id": answer_id,
         "grounding_overlap": result.grounding,
         # Everything the query actually opened. Recording only the retrieved hits
         # understated this: indexing reads every allowed note, including on a withheld

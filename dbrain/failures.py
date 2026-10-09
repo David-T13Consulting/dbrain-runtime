@@ -45,7 +45,8 @@ LOCK_NAME = ".lock"             # flock file: capture, reconcile and purge never
 
 # The one table of failure signals (P2.7 step C2, D113): which final outcome the phone saw
 # counts as a failure. A request may raise more than one; it is still captured once, with
-# all of them. The phone's one-tap "wrong" comes later, with the Shortcut.
+# all of them. `user_wrong` is the phone's one-tap "wrong" (step C5): never raised by an
+# outcome itself, only added by the service when David taps (serve.Service.mark_wrong).
 SIGNALS = {
     "withheld": "no answer: the model declined, or nothing was retrieved",
     # The date reader fails closed: any date-like text it cannot read fully makes the
@@ -57,6 +58,7 @@ SIGNALS = {
     "malformed": "the model's reply could not be used",
     "incomplete": "a defect: an id never offered, no citation, grounding below threshold, "
                   "or a verifier rejection (answer.DEFECTS)",
+    "user_wrong": "David marked the answer wrong on the phone (one tap, step C5)",
 }
 # Cited and grounded, but no verifier yet: not a failure. Counted in the audit log, never
 # stored (D113).
@@ -65,6 +67,9 @@ UNVERIFIED = answer.UNVERIFIED
 # delete(): a stored failure's id as capture() makes it, and a reason from a fixed list
 # (never caller text: the reason goes to the audit log, which must hold no question text).
 _ID = re.compile(r"[0-9]{1,12}-[0-9a-f]{8}")
+# The random id the phone got with an answer (step C5; serve.ANSWER_ID): text-free, so it
+# may go to the audit log, where it ties a failure to its trace line.
+_ANSWER_ID = re.compile(r"[0-9a-f]{32}")
 DELETE_REASONS = {
     "planted-test": "a planted test record, removed after the check it served (C4)",
     "david-request": "David chose to drop this failure before its 90 days",
@@ -120,6 +125,12 @@ def _check_delete(fid, reason):
         raise ValueError("not a failure id")
     if not (isinstance(reason, str) and reason in DELETE_REASONS):
         raise ValueError("reason: one of %s" % ", ".join(sorted(DELETE_REASONS)))
+
+
+def _check_answer_id(answer_id):
+    if answer_id is not None and not (isinstance(answer_id, str)
+                                      and _ANSWER_ID.fullmatch(answer_id)):
+        raise ValueError("not an answer id")
 
 
 def _digest(text):
@@ -245,13 +256,20 @@ class FailureStore:
             os.close(fd)
 
     # -- capture -----------------------------------------------------------------------
-    def capture(self, question, status_code, payload, reason_code=None):
+    def capture(self, question, status_code, payload, reason_code=None, added=(),
+                answer_id=None):
         """Keep a failed question and its answer; return the failure id, or None when the
         outcome raised no signal (nothing is written then; an unverified answer is only
-        counted). The intent is audited first: if that fails, nothing is stored. The record
-        is written under a temporary name and renamed into place, so it is either complete
-        or absent."""
-        signals = signals_for(status_code, payload, reason_code)
+        counted). `added` holds signals the outcome cannot raise itself (`user_wrong`, a
+        tap). The intent is audited first: if that fails, nothing is stored. The record is
+        written under a temporary name and renamed into place, so it is either complete or
+        absent. Once it is in place the id is returned even if the completion record is
+        lost (reconcile() writes it), so the caller never stores the same answer twice.
+        `answer_id`, if given, goes on the intent record, tying it to the trace line."""
+        if not all(isinstance(x, str) and x in SIGNALS for x in added):
+            raise ValueError("unknown signal")
+        _check_answer_id(answer_id)
+        signals = sorted(set(signals_for(status_code, payload, reason_code)) | set(added))
         if not signals:
             if (isinstance(payload, dict) and payload.get("status") == "incomplete"
                     and reason_code == UNVERIFIED):
@@ -259,9 +277,11 @@ class FailureStore:
             return None
         now = self.clock()
         fid = "%d-%s" % (int(now), secrets.token_hex(4))
+        linked = {"answer_id": answer_id} if answer_id is not None else {}
         self._audit("capturing", id=fid, signals=signals, status_code=status_code,
                     reason_code=reason_code,
-                    question_sha256=_digest(question), question_chars=len(question or ""))
+                    question_sha256=_digest(question), question_chars=len(question or ""),
+                    **linked)
         record = {"id": fid, "ts": int(now), "signals": signals, "status_code": status_code,
                   "reason_code": reason_code,
                   "status": payload.get("status") if isinstance(payload, dict) else None,
@@ -270,13 +290,41 @@ class FailureStore:
         data = json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8")
         with self._store_lock():
             self._publish(fid, data)
-            self._audit("captured", id=fid)   # if this is lost, reconcile() records it
+            try:
+                self._audit("captured", id=fid)
+            except Exception as exc:          # the record is stored: reconcile() records it
+                _report("captured", fid, exc)
         return fid
+
+    def add_signal(self, fid, signal, answer_id=None):
+        """Record that a stored failure raised one more signal (a tap on an answer already
+        captured for another signal): one text-free audit line, no second record and no
+        rewrite of the first. True if that failure is stored, False if it is gone."""
+        if not (isinstance(fid, str) and _ID.fullmatch(fid)):
+            raise ValueError("not a failure id")
+        if not (isinstance(signal, str) and signal in SIGNALS):
+            raise ValueError("unknown signal")
+        _check_answer_id(answer_id)
+        linked = {"answer_id": answer_id} if answer_id is not None else {}
+        with self._store_lock():
+            fd = outpath.open_dir_guarded(self.store, **_GUARD)
+            try:
+                try:
+                    st = os.stat(fid + ".json", dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return False
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError("not a regular file")
+                self._audit("signal_added", id=fid, signals=[signal], **linked)
+                return True
+            finally:
+                os.close(fd)
 
     def _publish(self, fid, data):
         """Write the record under a temporary name and rename it into place."""
         fd = outpath.open_dir_guarded(self.store, **_GUARD)
         tmp = TMP_PREFIX + fid
+        renamed = False
         try:
             f = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | outpath.O_NOFOLLOW, 0o600,
                         dir_fd=fd)
@@ -286,8 +334,13 @@ class FailureStore:
             finally:
                 os.close(f)
             os.rename(tmp, fid + ".json", src_dir_fd=fd, dst_dir_fd=fd)
+            renamed = True
             _sync(fd)
-        except BaseException:
+        except BaseException as exc:
+            if renamed and isinstance(exc, Exception):
+                # In place: report the failed sync; raising would hide a stored record.
+                _report("publish_sync", fid, exc)
+                return
             try:
                 os.unlink(tmp, dir_fd=fd)
             except OSError:

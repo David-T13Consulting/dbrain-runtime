@@ -47,6 +47,30 @@ iPhone Shortcut ── Tailscale (WireGuard) ──▶ this Air: dbrain.serve :8
      With the Air asleep nothing answers and the Shortcut hangs: Shortcuts has no client
      timeout, and David accepted this on the Air host (Q36).
 
+## Marking an answer wrong (P2.7 step C5)
+Every `/ask` reply carries `answer_id`, a random id (not derived from the question). While
+failure capture is on, the service keeps each recent question and its answer **in memory
+only, never on disk, for at most one hour** (data policy §7a, v0.8; D123): a tap is accepted
+for 59¾ minutes, and a sweep every 15 s drops anything older; a restart drops everything.
+`POST /wrong` with the same token and the body `{"id": "<answer_id>"}` (nothing else is
+accepted) stores that answer as a failure with the signal `user_wrong`, once; if it was
+stored already for another reason, the audit log gets one text-free line adding the signal.
+The reply's `display` says what happened (marked, already marked, too late, switched off).
+With capture off nothing is held and a tap stores nothing.
+
+**Shortcut change (David edits "Ask Brain" himself; about 2 minutes):**
+1. After **Get Contents of URL** (the `/ask` call), add **Get Dictionary Value**: key
+   `answer_id`, from *Contents of URL*. Then **Set Variable** `AnswerID` to it.
+2. In the existing **Get Dictionary Value** `display`, tap its input and choose the first
+   **Contents of URL** (the `/ask` result), not `AnswerID`; keep **Show Result** after it.
+3. Add **Choose from Menu**, prompt `Is this answer right?`, two items: `OK`, `Wrong`.
+4. Under `OK`: nothing (or **Stop This Shortcut**).
+5. Under `Wrong`: **Get Contents of URL** `http://<air-name>.<tailnet>.ts.net:8765/wrong`,
+   method POST, header `Authorization: Bearer <token>` (the same token as for `/ask`),
+   request body JSON with one key, `id`, of type Text, value the variable `AnswerID`.
+6. Still under `Wrong`: **Get Dictionary Value** `display` from that result › **Show Result**.
+7. Leave **End Menu** where Shortcuts puts it. Nothing else changes.
+
 ## What the service guarantees (tested in `tests/test_serve.py`)
 - Listens only on the Tailscale address (or loopback); refuses `0.0.0.0`, `::` and LAN
   addresses, and refuses any peer outside the tailnet.

@@ -31,6 +31,17 @@ class TraceTest(unittest.TestCase):
         self.assertNotIn(question, Path(path).read_text())
         self.assertNotIn("tempo", Path(path).read_text().lower().replace("tempo_block", ""))
 
+    def test_trace_carries_the_answer_id_it_is_given_and_none_otherwise(self):
+        # P2.7 step C5: the random id the phone got, so a "wrong" tap ties to this line.
+        _, record, _ = self.run_one()
+        self.assertIsNone(record["answer_id"])
+        model = adapter.StubAdapter(reply="Tempo means marathon pace or faster [E1]")
+        result = answer.ask("What does tempo mean?", profile=self.profile, model=model,
+                            vault=self.vault)
+        path = trace.write(result, model, self.profile, artifacts=self.artifacts,
+                           answer_id="a" * 32)
+        self.assertEqual(json.loads(Path(path).read_text().splitlines()[-1])["answer_id"], "a" * 32)
+
     def test_trace_records_paths_timings_and_model_version(self):
         _, record, _ = self.run_one()
         self.assertTrue(record["paths_retrieved"])
