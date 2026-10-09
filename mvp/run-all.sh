@@ -14,10 +14,15 @@ SERVER="$APP/llama/llama-b11146/llama-server"
 MODEL="$APP/models/gemma-4-E4B_q4_0-it.gguf"
 MODEL_PIN=676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee
 # Logs outside the vault and outside git (data policy §7b, P2.7 step C3b): config.LOGS,
-# ~/Library/Application Support/dbrain/logs unless DBRAIN_LOGS says otherwise.
+# ~/Library/Application Support/dbrain/logs unless DBRAIN_LOGS says otherwise. The service
+# gets the checked absolute path back, so a relative DBRAIN_LOGS cannot resolve elsewhere.
 LOGS=$(PYTHONPATH="$HERE" python3 -m dbrain.outpath logdir \
     "$(PYTHONPATH="$HERE" python3 -c 'from dbrain import config; print(config.LOGS)')") || exit 1
 logged() { PYTHONPATH="$HERE" python3 -m dbrain.outpath exec-logged "$@"; }
+# P2.7 failure capture (D119, David 9 Oct): "on" keeps a failed question and its answer in
+# the store for 90 days (data policy §7a). To switch it off, set "off" and restart this
+# launcher; stored failures are still deleted on schedule.
+CAPTURE=on
 [ -x "$SERVER" ] && [ -f "$MODEL" ] || { echo "run mvp/prepare-model.sh first" >&2; exit 1; }
 [ "$(shasum -a 256 "$MODEL" | cut -d' ' -f1)" = "$MODEL_PIN" ] || { echo "PIN MISMATCH $MODEL" >&2; exit 1; }
 
@@ -37,6 +42,7 @@ LLAMA_LOOP=$!
 ( cd "$HERE" && while :; do
     env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u GOOGLE_API_KEY -u GEMINI_API_KEY \
         -u MISTRAL_API_KEY -u COHERE_API_KEY -u HF_TOKEN \
+        DBRAIN_LOGS="$LOGS" DBRAIN_FAILURE_CAPTURE="$CAPTURE" \
         PYTHONPATH="$HERE" python3 -m dbrain.outpath exec-logged \
         "$LOGS/ask-$(date +%Y%m%dT%H%M%S).log" python3 -m dbrain.serve
     rc=$?

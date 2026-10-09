@@ -399,6 +399,107 @@ class RetentionTest(StoreFixture):
         self.assertEqual(len(self.stored()), 1)
 
 
+class DeleteTest(StoreFixture):
+    """C4: the planted record is removed through the store's own deletion path."""
+
+    def test_one_failure_is_deleted_on_request_and_audited_with_its_reason(self):
+        keep = self.store.capture(PLANTED_Q, 200, {"status": "withheld", "answer": ""})
+        gone = self.store.capture(PLANTED_Q, 200, {"status": "withheld", "answer": PLANTED_A})
+        self.assertTrue(self.store.delete(gone, "planted-test"))
+        self.assertEqual([p.stem for p in self.stored()], [keep])
+        events = [(e["event"], e.get("id"), e.get("reason")) for e in self.audit_lines()
+                  if e["event"] in ("deleting", "deleted")]
+        self.assertEqual(events, [("deleting", gone, "planted-test"), ("deleted", gone, "planted-test")])
+        text = (self.home / "logs" / failures.AUDIT_NAME).read_text()
+        for planted in ("PLANTED-Q-4e1d", "PLANTED-A-9b77", "Zoe", "blue bag"):
+            self.assertNotIn(planted, text)
+
+    def test_an_unknown_id_deletes_nothing_and_audits_nothing(self):
+        self.store.capture(PLANTED_Q, 200, {"status": "withheld", "answer": ""})
+        before = self.audit_lines()
+        self.assertFalse(self.store.delete("1800000000-0123abcd", "planted-test"))
+        self.assertEqual(len(self.stored()), 1)
+        self.assertEqual(self.audit_lines(), before)
+
+    def test_ids_and_reasons_outside_the_fixed_forms_are_refused(self):
+        fid = self.store.capture(PLANTED_Q, 200, {"status": "withheld", "answer": ""})
+        for bad_id in ("../logs/" + failures.AUDIT_NAME, fid + ".json", "", None, ".lock",
+                       fid + "\n"):
+            with self.subTest(fid=bad_id), self.assertRaises(ValueError):
+                self.store.delete(bad_id, "planted-test")
+        for bad_reason in ("which bag does Zoe need", "where-is-zoe", "planted-c4", "",
+                           "Planted-Test", "planted-test ", None, "a\nb"):
+            with self.subTest(reason=bad_reason), self.assertRaises(ValueError):
+                self.store.delete(fid, bad_reason)
+        self.assertEqual(len(self.stored()), 1)
+
+    def test_a_non_file_under_a_valid_id_is_refused(self):
+        self.store.capture(PLANTED_Q, 200, {"status": "withheld", "answer": ""})
+        (self.home / "failures" / "1800000000-0123abcd.json").mkdir()
+        with self.assertRaises(OSError):
+            self.store.delete("1800000000-0123abcd", "planted-test")
+        self.assertFalse(any(e["event"] == "deleting" for e in self.audit_lines()))
+
+    def test_a_lost_completion_keeps_the_reason_when_reconciled(self):
+        fid = self.store.capture(PLANTED_Q, 200, {"status": "withheld", "answer": ""})
+        real = self.store._audit
+
+        def flaky(event, **fields):
+            if event == "deleted":
+                raise OSError("disk full")
+            return real(event, **fields)
+        self.store._audit = flaky
+        with self.assertRaises(OSError):
+            self.store.delete(fid, "planted-test")
+        self.store._audit = real
+        self.assertEqual(self.stored(), [])
+        self.assertEqual(self.store.reconcile()["deleted"], [fid])
+        done = [e for e in self.audit_lines() if e["event"] == "deleted"]
+        self.assertEqual([(e["id"], e["reason"], e["reconciled"]) for e in done],
+                         [(fid, "planted-test", True)])
+
+    def test_the_command_deletes_one_record_and_prints_only_its_id(self):
+        import subprocess
+        import sys
+        root = Path(__file__).resolve().parent.parent
+        home = Path(tempfile.mkdtemp(prefix="dbrain-cli-home-")).resolve()   # /var is a symlink
+        os.chmod(home, 0o700)
+        app = home / "Library" / "Application Support" / "dbrain"
+        store = failures.FailureStore(store=app / "failures", logs=app / "logs")
+        keep = store.capture(PLANTED_Q, 200, {"status": "withheld", "answer": ""})
+        gone = store.capture(PLANTED_Q, 200, {"status": "withheld", "answer": PLANTED_A})
+        env = dict(os.environ, PYTHONPATH=str(root), HOME=str(home))
+        out = subprocess.run([sys.executable, "-m", "dbrain.failures", "delete", gone,
+                              "planted-test"], cwd=str(root), env=env, capture_output=True,
+                             text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "deleted %s\n" % gone)
+        self.assertEqual(out.stderr, "")
+        self.assertEqual(sorted(p.stem for p in (app / "failures").glob("*.json")), [keep])
+        audit = [json.loads(l) for l in (app / "logs" / failures.AUDIT_NAME).read_text().splitlines()]
+        self.assertEqual([(e["event"], e["reason"]) for e in audit if e.get("id") == gone
+                          and e["event"] in ("deleting", "deleted")],
+                         [("deleting", "planted-test"), ("deleted", "planted-test")])
+        again = subprocess.run([sys.executable, "-m", "dbrain.failures", "delete", gone,
+                                "planted-test"], cwd=str(root), env=env, capture_output=True,
+                               text=True)
+        self.assertEqual((again.returncode, again.stdout), (1, "no such failure %s\n" % gone))
+
+    def test_the_command_refuses_bad_input_without_touching_the_store(self):
+        import subprocess
+        import sys
+        root = Path(__file__).resolve().parent.parent
+        env = dict(os.environ, PYTHONPATH=str(root), HOME=str(self.home))
+        for args in (["delete", "../x", "planted-test"], ["delete", "1-0123abcd", "Free Text"],
+                     ["delete", "1-0123abcd", "where-is-zoe"], ["list"]):
+            with self.subTest(args=args):
+                out = subprocess.run([sys.executable, "-m", "dbrain.failures"] + args,
+                                     cwd=str(root), env=env, capture_output=True, text=True)
+                self.assertNotEqual(out.returncode, 0)
+        # (Apple's Python may create Library/Caches under HOME: not the store.)
+        self.assertFalse((self.home / "Library" / "Application Support").exists())
+
+
 class RoundOneC1RegressionTest(StoreFixture):
     """Step C1, review 1 (9 Oct): no silent double failure; durable intents; no FIFO hang."""
 

@@ -22,6 +22,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import stat
 import sys
@@ -60,6 +61,14 @@ SIGNALS = {
 # Cited and grounded, but no verifier yet: not a failure. Counted in the audit log, never
 # stored (D113).
 UNVERIFIED = answer.UNVERIFIED
+
+# delete(): a stored failure's id as capture() makes it, and a reason from a fixed list
+# (never caller text: the reason goes to the audit log, which must hold no question text).
+_ID = re.compile(r"[0-9]{1,12}-[0-9a-f]{8}")
+DELETE_REASONS = {
+    "planted-test": "a planted test record, removed after the check it served (C4)",
+    "david-request": "David chose to drop this failure before its 90 days",
+}
 
 _GUARD = {"outside_git": True, "private": True, "strict": True}
 _AUDIT_LOCK = threading.Lock()   # in-process; flock serialises across processes
@@ -103,6 +112,14 @@ def signals_for(status_code, payload, reason_code=None):
     if status == "incomplete" and reason_code != UNVERIFIED:
         found.add("incomplete")
     return sorted(found)
+
+
+def _check_delete(fid, reason):
+    """delete()'s arguments: an id of capture()'s form and a reason from DELETE_REASONS."""
+    if not (isinstance(fid, str) and _ID.fullmatch(fid)):
+        raise ValueError("not a failure id")
+    if not (isinstance(reason, str) and reason in DELETE_REASONS):
+        raise ValueError("reason: one of %s" % ", ".join(sorted(DELETE_REASONS)))
 
 
 def _digest(text):
@@ -305,7 +322,7 @@ class FailureStore:
     def _reconcile(self):
         events = self._audit_events()
         captured = {e.get("id") for e in events if e.get("event") == "captured"}
-        deleting = {e.get("id") for e in events if e.get("event") == "deleting"}
+        deleting = {e.get("id"): e.get("reason") for e in events if e.get("event") == "deleting"}
         deleted = {e.get("id") for e in events if e.get("event") == "deleted"}
         out = {"captured": [], "deleted": []}
         fd = outpath.open_dir_guarded(self.store, **_GUARD)
@@ -327,10 +344,13 @@ class FailureStore:
                         self._audit("reconcile_error", id=fid, error=type(exc).__name__)
                     except Exception as audit_exc:
                         _report("reconcile_error", fid, audit_exc)
-            for fid in sorted(i for i in deleting - deleted if isinstance(i, str)):
+            for fid in sorted(i for i in set(deleting) - deleted if isinstance(i, str)):
                 if fid + ".json" not in names:
-                    self._audit("deleted", id=fid, reason="retention %d days" % RETENTION_DAYS,
-                                reconciled=True)
+                    # A lost completion keeps the reason its intent gave (retention or delete()).
+                    reason = deleting[fid]
+                    if not (isinstance(reason, str) and reason):
+                        reason = "retention %d days" % RETENTION_DAYS
+                    self._audit("deleted", id=fid, reason=reason, reconciled=True)
                     out["deleted"].append(fid)
         finally:
             os.close(fd)
@@ -384,6 +404,30 @@ class FailureStore:
             os.close(fd)
         return deleted
 
+    def delete(self, fid, reason):
+        """Delete one stored failure now, on David's request (the planted record of the C4
+        end-to-end check, or one he chooses to drop), recorded in the audit log like a
+        retention deletion: intent, unlink, completion. `reason` is a key of
+        DELETE_REASONS, never free text. Returns True if it was deleted, False if no such failure is stored."""
+        _check_delete(fid, reason)
+        name = fid + ".json"
+        with self._store_lock():
+            fd = outpath.open_dir_guarded(self.store, **_GUARD)
+            try:
+                try:
+                    st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return False
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError("not a regular file")
+                self._audit("deleting", id=fid, reason=reason)
+                os.unlink(name, dir_fd=fd)
+                _sync(fd)
+                self._audit("deleted", id=fid, reason=reason)   # reconcile() if lost
+                return True
+            finally:
+                os.close(fd)
+
     def start_retention(self, interval=RETENTION_INTERVAL):
         """Run reconcile() and purge() now and then every `interval` seconds, in a daemon
         thread, for as long as the service runs. Errors are reported by type only."""
@@ -400,3 +444,17 @@ class FailureStore:
         t = threading.Thread(target=loop, name="dbrain-failure-retention", daemon=True)
         t.start()
         return t
+
+
+if __name__ == "__main__":
+    # python3 -m dbrain.failures delete <id> <reason>: run by David in his own Terminal
+    # (agents are kept out of the store, D108/D110). Prints the id and the outcome only.
+    if len(sys.argv) == 4 and sys.argv[1] == "delete":
+        try:
+            _check_delete(sys.argv[2], sys.argv[3])     # before the store is even opened
+            done = FailureStore().delete(sys.argv[2], sys.argv[3])
+        except (ValueError, outpath.OutsideVaultError) as exc:
+            raise SystemExit("REFUSED: %s" % exc)
+        print("%s %s" % ("deleted" if done else "no such failure", sys.argv[2]))
+        raise SystemExit(0 if done else 1)
+    raise SystemExit("usage: python3 -m dbrain.failures delete <id> <reason>")

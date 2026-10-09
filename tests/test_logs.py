@@ -144,6 +144,28 @@ class LauncherTest(unittest.TestCase):
             self.assertTrue("logged" in line or "exec-logged" in line or "exec-logged" in prev[i - 1],
                             line)
 
+    def service_env_lines(self):
+        text = (HERE / "mvp" / "run-all.sh").read_text()
+        start = text.index("# /ask service")
+        return text[start:text.index("python3 -m dbrain.serve", start)]
+
+    def test_the_service_gets_the_checked_absolute_log_folder(self):
+        # A relative DBRAIN_LOGS would resolve against the service's own working folder
+        # (C3b should-fix); the launcher passes back the real path logdir printed.
+        self.assertIn('DBRAIN_LOGS="$LOGS"', self.service_env_lines())
+
+    def test_capture_is_one_switch_passed_to_the_service(self):
+        text = (HERE / "mvp" / "run-all.sh").read_text()
+        self.assertEqual(len(re.findall(r"^CAPTURE=(on|off)$", text, re.M)), 1)
+        self.assertIn('DBRAIN_FAILURE_CAPTURE="$CAPTURE"', self.service_env_lines())
+
+    def test_a_relative_log_folder_comes_back_absolute(self):
+        base = Path(tempfile.mkdtemp(prefix="dbrain-rel-logs-"))
+        out = outpath_cli("logdir", "logs", cwd=base)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(Path(out.stdout.strip()).is_absolute())
+        self.assertEqual(Path(out.stdout.strip()), (base / "logs").resolve())
+
     def test_the_launcher_parses(self):
         self.assertEqual(subprocess.run(["sh", "-n", str(HERE / "mvp" / "run-all.sh")]).returncode, 0)
 
