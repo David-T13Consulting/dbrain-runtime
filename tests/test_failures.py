@@ -601,8 +601,8 @@ class EndpointCaptureTest(EndpointFixture):
         code, body = self.request("POST", "/ask", {"question": PLANTED_EP})   # cited, grounded
         self.assertEqual((code, body["status"]), (200, "incomplete"))
         path = self.home / "logs" / failures.AUDIT_NAME
-        for _ in range(50):
-            if path.exists():
+        for _ in range(100):              # a complete record, not just the file
+            if path.exists() and path.read_text().endswith("\n"):
                 break
             time.sleep(0.02)
         events = [json.loads(l) for l in path.read_text().splitlines()]
@@ -636,6 +636,33 @@ class EndpointCaptureTest(EndpointFixture):
         for planted in ("plantedmarkerqx", "marathon pace"):
             self.assertNotIn(planted, text)
         self.assertNotIn("plantedmarkerqx", (self.home / "logs" / failures.AUDIT_NAME).read_text())
+
+    def captured_signals(self, n):
+        path = self.home / "logs" / failures.AUDIT_NAME
+        for _ in range(100):
+            if path.exists() and path.read_text().count('"captured"') >= n:
+                break
+            time.sleep(0.02)
+        return [e["signals"] for e in map(json.loads, path.read_text().splitlines())
+                if e["event"] == "capturing"]
+
+    def test_a_model_outage_is_captured_once_as_unavailable(self):
+        class Down(adapter.StubAdapter):
+            def generate(self, prompt, max_tokens=320):
+                raise adapter.ModelUnavailable("down")
+        self.service.model_factory = lambda: Down()
+        code, body = self.request("POST", "/ask", {"question": PLANTED_EP})
+        self.assertEqual((code, body["status"]), (503, "unavailable"))
+        self.assertEqual(self.captured_signals(1), [["unavailable"]])
+
+    def test_a_malformed_reply_is_captured_once_as_malformed(self):
+        class Broken(adapter.StubAdapter):
+            def generate(self, prompt, max_tokens=320):
+                raise adapter.MalformedResponse("generation did not finish")
+        self.service.model_factory = lambda: Broken()
+        code, body = self.request("POST", "/ask", {"question": PLANTED_EP})
+        self.assertEqual((code, body["status"]), (200, "malformed"))
+        self.assertEqual(self.captured_signals(1), [["malformed"]])
 
     def test_the_phone_never_sees_the_reason_code(self):
         code, body = self.request("POST", "/ask", {"question": PLANTED_EP})

@@ -14,6 +14,14 @@ ARTIFACTS = Path(
     os.environ.get("DBRAIN_ARTIFACTS", Path(__file__).resolve().parent.parent / "artifacts")
 )
 
+# The service's §7b logs (data policy v0.7): the per-question trace, the service log and
+# the model server's log, with the failure loop's audit log beside them. Outside the vault
+# and outside git, on the host (P2.7 step C3b): a git-ignored folder inside a repository
+# is still inside git. Measurement evidence stays under ARTIFACTS.
+LOGS = Path(
+    os.environ.get("DBRAIN_LOGS", Path.home() / "Library" / "Application Support" / "dbrain" / "logs")
+)
+
 
 class Profile:
     """An allowlist. `roots` are directories; `files` are individual notes."""

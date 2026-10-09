@@ -7,7 +7,8 @@ skipped and traced, never indexed; the other notes still answer. A note with a r
 `client` label, or conflicting labels, is not skipped: it **pauses** the service (every
 question gets 423 "Paused", the path goes to this Mac's log as `POLICY FLAG`, nothing is
 answered) until it is removed or relabelled. Answers come from the local model on this Mac; the
-service writes only traces and logs to the git-ignored `artifacts/` folder.
+service writes only traces and logs, to `~/Library/Application Support/dbrain/logs/`
+(outside the vault and outside git; data policy §7b).
 
 Dates: one plain date per question is read (today, tomorrow, the day after tomorrow,
 yesterday, a weekday with this/next/on, this or next weekend, this or next week, an explicit
@@ -64,6 +65,9 @@ questions or answers. The hop is plain HTTP inside the WireGuard tunnel; if the 
 refuses `http://`, `tailscale serve` can put HTTPS in front with a tailnet certificate.
 
 ## Logs and traces
-`artifacts/logs/` (service and model logs: method, path, status; never the question or
-token) and `artifacts/traces-YYYY-MM-DD.jsonl` (question as a SHA-256, paths read,
-timings, status).
+In `~/Library/Application Support/dbrain/logs/` (`DBRAIN_LOGS` overrides it; refused
+inside the vault or a git working tree): service and model logs (method, path, status;
+never the question or token; the model server's log was checked with
+`experiments/server_log_check.py`) and `traces-YYYY-MM-DD.jsonl` (question as a SHA-256,
+paths read, timings, status, `reason_code`). Logs and traces written before 9 Oct are in
+the runtime's git-ignored `artifacts/` folder.

@@ -139,13 +139,13 @@ class IncompleteReadTest(unittest.TestCase):
         endpoint = "http://127.0.0.1:%d" % listener.getsockname()[1]
         artifacts = Path(tempfile.mkdtemp(prefix="dbrain-ir-"))
         vault, _, _ = fake_vault.build()
-        saved = (config.ARTIFACTS, config.PROFILES.get("default"), config.VAULT)
-        config.ARTIFACTS, config.PROFILES["default"], config.VAULT = artifacts, fake_vault.PROFILE, vault
+        saved = (config.LOGS, config.PROFILES.get("default"), config.VAULT)
+        config.LOGS, config.PROFILES["default"], config.VAULT = artifacts, fake_vault.PROFILE, vault
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 rc = cli.main(["What does tempo mean?", "--endpoint", endpoint])
         finally:
-            config.ARTIFACTS, config.PROFILES["default"], config.VAULT = saved
+            config.LOGS, config.PROFILES["default"], config.VAULT = saved
             listener.close()
         self.assertEqual(rc, 3)
         traces = list(artifacts.glob("traces-*.jsonl"))

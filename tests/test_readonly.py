@@ -69,7 +69,7 @@ class ReadOnlyTest(unittest.TestCase):
 
     def test_traces_default_outside_the_vault(self):
         self.assertFalse(
-            str(Path(config.ARTIFACTS).resolve()).startswith(
+            str(Path(config.LOGS).resolve()).startswith(
                 str(Path(config.VAULT).resolve()) + os.sep),
             "the default trace directory is inside the vault")
 

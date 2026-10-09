@@ -1,8 +1,9 @@
-"""Redacted per-query trace, written outside the vault (P2.2 "Done when" 6).
+"""Redacted per-query trace, written outside the vault and outside git (P2.2 "Done when"
+6; data policy §7b; P2.7 step C3b).
 
 The question is hashed, not stored: traces must not become a shadow copy of what David
 asks. The destination is checked by outpath.py, because it is configurable and a
-symlinked directory could otherwise aim a write back into the vault.
+symlinked directory could otherwise aim a write back into the vault or into a repository.
 """
 import hashlib
 import json
@@ -14,8 +15,9 @@ from . import config, outpath
 
 
 def write(result, model, profile, artifacts=None):
-    root = Path(artifacts or config.ARTIFACTS)
+    root = Path(artifacts or config.LOGS)
     outpath.assert_outside_vault(root)
+    outpath.assert_outside_git(root)
     # No mkdir here: open_for_write creates missing directories inside its anchored walk.
     path = root / ("traces-%s.jsonl" % time.strftime("%Y-%m-%d"))
     outpath.assert_outside_vault(path)
@@ -45,6 +47,6 @@ def write(result, model, profile, artifacts=None):
         "model": model.describe(),
         "cloud_keys_present_but_unused": adapter_mod.cloud_keys_present(),
     }
-    with outpath.open_for_write(path, append=True) as fh:
+    with outpath.open_for_write(path, append=True, outside_git=True) as fh:
         fh.write(json.dumps(record, sort_keys=True) + "\n")
     return path

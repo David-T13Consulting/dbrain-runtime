@@ -63,16 +63,16 @@ class TraceTest(unittest.TestCase):
             def generate(self, prompt, max_tokens=320):
                 raise adapter.MalformedResponse("generation did not finish")
 
-        saved = (cli.adapter_mod.StubAdapter, config.ARTIFACTS, config.PROFILES.get("default"))
+        saved = (cli.adapter_mod.StubAdapter, config.LOGS, config.PROFILES.get("default"))
         cli.adapter_mod.StubAdapter = Broken
-        config.ARTIFACTS = self.artifacts
+        config.LOGS = self.artifacts
         config.PROFILES["default"] = self.profile
         try:
             import io, contextlib
             with contextlib.redirect_stderr(io.StringIO()):
                 rc = cli.main(["What does tempo mean?", "--stub-model"])
         finally:
-            cli.adapter_mod.StubAdapter, config.ARTIFACTS, config.PROFILES["default"] = saved
+            cli.adapter_mod.StubAdapter, config.LOGS, config.PROFILES["default"] = saved
         self.assertEqual(rc, 3)
         traces = list(self.artifacts.glob("traces-*.jsonl"))
         self.assertEqual(len(traces), 1)
@@ -94,16 +94,16 @@ class TraceTest(unittest.TestCase):
                     "local model returned an error: {'message': %r, 'url': 'http://x/?q=%s'}"
                     % (secret_q, secret_q))
 
-        saved = (cli.adapter_mod.StubAdapter, config.ARTIFACTS, config.PROFILES.get("default"))
+        saved = (cli.adapter_mod.StubAdapter, config.LOGS, config.PROFILES.get("default"))
         cli.adapter_mod.StubAdapter = Echoing
-        config.ARTIFACTS = self.artifacts
+        config.LOGS = self.artifacts
         config.PROFILES["default"] = self.profile
         try:
             import io, contextlib
             with contextlib.redirect_stderr(io.StringIO()):
                 cli.main([secret_q, "--stub-model"])
         finally:
-            cli.adapter_mod.StubAdapter, config.ARTIFACTS, config.PROFILES["default"] = saved
+            cli.adapter_mod.StubAdapter, config.LOGS, config.PROFILES["default"] = saved
         text = "".join(p.read_text() for p in self.artifacts.glob("traces-*.jsonl"))
         self.assertTrue(text)
         self.assertNotIn("ZZQUESTIONMARKERZZ", text)

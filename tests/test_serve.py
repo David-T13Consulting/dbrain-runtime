@@ -89,8 +89,8 @@ class EndpointFixture(unittest.TestCase):
         self.addCleanup(faulthandler.cancel_dump_traceback_later)
         self.vault = whole_vault_fixture()
         self.artifacts = Path(self.vault.parent / (self.vault.name + "-artifacts"))
-        self._saved = config.ARTIFACTS
-        config.ARTIFACTS = self.artifacts
+        self._saved = config.LOGS
+        config.LOGS = self.artifacts
         self.model = adapter.StubAdapter(reply="Tempo means marathon pace or faster [E1]")
         self.service = serve.Service(TOKEN, model_factory=lambda: self.model,
                                      vault=self.vault, model_health=lambda: "up")
@@ -101,7 +101,7 @@ class EndpointFixture(unittest.TestCase):
     def tearDown(self):
         self.server.shutdown()
         self.server.server_close()
-        config.ARTIFACTS = self._saved
+        config.LOGS = self._saved
 
     def request(self, method, path, body=None, token=TOKEN, raw=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)

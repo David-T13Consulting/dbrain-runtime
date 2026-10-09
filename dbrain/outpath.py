@@ -292,13 +292,39 @@ def _inside(path, root):
         return False
 
 
+def exec_logged(log_path, argv):
+    """Run argv with stdout and stderr on a log file opened through the anchored walk with
+    the outside-git check (P2.7 step C3b, data policy §7b). The check and the open are one
+    descriptor chain, so the file cannot be redirected into the vault or a repository
+    between them. Replaces this process (exec); returns only by raising."""
+    if not argv:
+        raise OutsideVaultError("exec-logged: no command to run")
+    with open_for_write(log_path, append=True, outside_git=True) as fh:   # never truncates
+        fd = os.dup(fh.fileno())
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
+    os.execvp(argv[0], argv)
+
+
 if __name__ == "__main__":
     # python3 -m dbrain.outpath mkdir <path>: used by measure.sh before its first write.
+    # python3 -m dbrain.outpath logdir <path>: create and check a log folder (outside the
+    #     vault and outside git); prints its real path. Used by mvp/run-all.sh.
+    # python3 -m dbrain.outpath exec-logged <log file> <command> [args...]: used by
+    #     mvp/run-all.sh for every log it writes.
     import sys
 
-    if len(sys.argv) != 3 or sys.argv[1] != "mkdir":
-        raise SystemExit("usage: python3 -m dbrain.outpath mkdir <path>")
     try:
-        print(make_dir(sys.argv[2]))
+        if len(sys.argv) == 3 and sys.argv[1] == "mkdir":
+            print(make_dir(sys.argv[2]))
+        elif len(sys.argv) == 3 and sys.argv[1] == "logdir":
+            os.close(open_dir_guarded(sys.argv[2], outside_git=True))
+            print(assert_outside_git(sys.argv[2]))
+        elif len(sys.argv) >= 4 and sys.argv[1] == "exec-logged":
+            exec_logged(sys.argv[2], sys.argv[3:])
+        else:
+            raise SystemExit("usage: python3 -m dbrain.outpath mkdir <path> | logdir <path> | "
+                             "exec-logged <log file> <command> [args...]")
     except OutsideVaultError as exc:
         raise SystemExit("REFUSED: %s" % exc)
