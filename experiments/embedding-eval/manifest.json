@@ -213,7 +213,31 @@
    "typer==0.27.3",
    "typing_extensions==4.16.0"
   ],
-  "mps_available": true
+  "mps_available": true,
+  "added_after_s3": [
+   {
+    "package": "pillow==12.3.0",
+    "why": "Q96 (a), David 9 Oct: sentence-transformers builds EmbeddingGemma 2's processor even for text and needs PIL (transformers[vision] declares Pillow>=10.0.1,<=15.0)",
+    "installed_at": "2026-10-12T13:42+0200 (session 46)",
+    "command": "pip install --no-deps pillow==12.3.0 (into this venv only)",
+    "wheel": "pillow-12.3.0-cp312-cp312-macosx_11_0_arm64.whl",
+    "wheel_bytes": 4780323,
+    "wheel_sha256": "ffd0c5368496f41b0944be820fcb7a838aa6e623d250b01acf2643939c3f99d7",
+    "version_list_evidence": "artifacts/m6b/s4-pillow-versions-20261012-1342.txt (pip index versions, before the install)",
+    "venv_size_after": "1.1 GB"
+   },
+   {
+    "package": "torchvision==0.29.1",
+    "why": "S4 attempt 1 (12 Oct 13:42): arm B still failed after Pillow: EmbeddingGemma2Processor imports torchvision. Declared by transformers' `vision` extra (Requires-Dist: torchvision; extra == \"vision\"), the same extra Q96 followed; standing approval (4), D127",
+    "version_choice": "0.29.1 declares torch>=2.14.0, matching the pinned torch 2.14.1; installed with --no-deps, so torch is unchanged",
+    "installed_at": "2026-10-12T13:44+0200 (session 46)",
+    "wheel": "torchvision-0.29.1-cp312-cp312-macosx_14_0_arm64.whl",
+    "wheel_bytes": 1813847,
+    "wheel_sha256": "3b6eb9d2f8fe9b93d9d37637749df361efeed133d96ddd503184a1b5b12bb27f",
+    "version_list_evidence": "artifacts/m6b/s4-torchvision-versions-20261012.txt (pip index versions, before the install)",
+    "venv_size_after": "1.1 GB"
+   }
+  ]
  },
  "disk": {
   "free_before_venv": "78 GiB",
