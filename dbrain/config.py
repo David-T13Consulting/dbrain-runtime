@@ -27,10 +27,14 @@ class Profile:
     """An allowlist. `roots` are directories; `files` are individual notes."""
 
     def __init__(self, name, roots=(), files=(), sections=None, exclude_hidden=False,
-                 skip_unlabelled=False):
+                 skip_unlabelled=False, excludes=()):
         self.name = name
         self.roots = tuple(roots)
         self.files = tuple(files)
+        # Vault-relative folders or files carved out of the allowlist (P2.8 A1). An entry
+        # removes itself and everything under it; it wins over `roots` and `files`, and is
+        # compared without regard to case or Unicode form, as the Mac's file system does.
+        self.excludes = tuple(excludes)
         # Whole-vault profiles: never read `.git`, `.obsidian` or any other dot-folder.
         self.exclude_hidden = exclude_hidden
         # Whole-vault profiles: a note with no `classification`, another label, or
@@ -75,11 +79,26 @@ DEFAULT = Profile("default", files=SCOPED_FILES, sections=SCOPED_SECTIONS)
 # now that the brief's allowlist *is* the dev-case corpus.
 DEVCASES = Profile("devcases", files=SCOPED_FILES, sections=SCOPED_SECTIONS)
 
+# The system's own working notes, which the phone must not search (P2.8 A1, D133, 14 Oct).
+# Since 5 Oct they quote test questions almost word for word, so keyword retrieval ranked
+# them above the life notes the questions are about. An exclude list rather than an
+# allowlist, so a new life folder is found without a config change. `00 Inbox` stays in.
+SYSTEM_NOTES = (
+    "90 System",                                   # briefs, handoff, for-david, reports
+    "10 Projects/AI Second Brain",                 # this project: PROGRESS, DECISIONS, specs
+    "40 Archive/agent-orchestration-proposal.md",  # the agents' own design record
+    "AGENTS.md",                                   # the agents' rulebook
+    "CLAUDE.md",
+    "index.md",                                    # the vault catalogue
+    "log.md",                                      # the agents' operations log
+)
+
 # MVP-phone (David, Q34, 5 Oct): the whole vault, read-only, for questions from the
 # iPhone. Root "" is the vault itself. Dot-folders are excluded; the reserved acceptance
 # cases live outside the vault, so they are unreachable by construction. Not used by the
-# dev-case measurements, which stay on the three-file corpus.
+# dev-case measurements, which stay on the three-file corpus. The name is kept because
+# traces record it; since P2.8 the profile is the whole vault minus SYSTEM_NOTES.
 MVP_WHOLE_VAULT = Profile("mvp-whole-vault", roots=("",), exclude_hidden=True,
-                          skip_unlabelled=True)
+                          skip_unlabelled=True, excludes=SYSTEM_NOTES)
 
 PROFILES = {p.name: p for p in (DEFAULT, DEVCASES, MVP_WHOLE_VAULT)}

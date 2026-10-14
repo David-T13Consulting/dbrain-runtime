@@ -16,6 +16,7 @@ Step 3 also closes the check-then-open race: the descriptor chain *is* the check
 """
 import errno
 import os
+import unicodedata
 from pathlib import Path, PurePosixPath
 
 from . import config
@@ -56,9 +57,27 @@ def relative_parts(path, vault=None):
     return tuple(parts)
 
 
+def _fold(parts):
+    # The Mac's file system matches names regardless of case and Unicode normalisation, so
+    # an exclusion compared exactly would let "90 system/x.md" open "90 System/x.md".
+    return tuple(unicodedata.normalize("NFC", p).casefold() for p in parts)
+
+
+def _excluded(parts, profile):
+    """True if `parts` is an excluded folder or file, or lies under one."""
+    folded = _fold(parts)
+    for e in getattr(profile, "excludes", ()):
+        ex = _fold(relative_parts_literal(e))
+        if folded[: len(ex)] == ex:  # an empty entry excludes everything: fails closed
+            return True
+    return False
+
+
 def _allowed_by_profile(parts, profile):
     if getattr(profile, "exclude_hidden", False) and any(p.startswith(".") for p in parts):
         return False
+    if _excluded(parts, profile):
+        return False  # an exclusion wins over every root and file
     for f in profile.files:
         if parts == relative_parts_literal(f):
             return True
@@ -207,6 +226,8 @@ def iter_allowed_files(profile, vault=None):
     seen = set()
     out = []
     for parts in found:
+        if not _allowed_by_profile(parts, profile):
+            continue  # exclusions and dot-folders, whichever root or file found it
         if parts not in seen:
             seen.add(parts)
             out.append(parts)
