@@ -651,13 +651,51 @@ def quote_lines(chunk_text, answer_text, k=2, width=160):
     return out
 
 
+NEGATION_REASON = "the answer says nothing is on, but a note it cites lists that day"
+
+
+def check_dated_negation(result, days):
+    """P2.5 F2: a bare "nothing on <day>" answer against a cited table row for that day
+    becomes the defect `negation_vs_dated_evidence`, so P2.7 captures it. The phone keeps
+    the model's answer and adds the row below it (David, 13 Oct, session 47: a wrong fire
+    must never hide a correct answer). Answers that cite nothing are not checked (Q102)."""
+    if not days or result.status not in (answer.INCOMPLETE, answer.WITHHELD) \
+            or result.reason_code == answer.NO_EVIDENCE or not result.answer:
+        return None
+    # Exactly the ids answer.ask offered ("E1", not "E01" or "E١"); any other id and the
+    # check stays silent (F2 D74 consult, 13 Oct). The heading goes with the text, so a
+    # year or a doubtful word in it counts.
+    by_id = {"E%d" % i: (i, c) for i, (_, c) in enumerate(result.hits, 1)}
+    ids = answer.CITE.findall(result.answer)
+    if any(cid not in by_id for cid in ids):
+        return None
+    cited = []
+    for cid in dict.fromkeys(ids):
+        label, chunk = by_id[cid]
+        cited.append((label, "%s\n%s" % (chunk.heading or "", chunk.text)))
+    hit = answer.dated_contradiction(result.answer, cited, days)
+    if hit is None:
+        return None
+    label, line = hit
+    if line.startswith("|"):  # a table row: its cells, without the pipes
+        line = " · ".join(cell.strip() for cell in line.strip("|").split("|") if cell.strip())
+    result.status = answer.INCOMPLETE
+    result.reason_code = answer.NEGATION_VS_DATED
+    result.reason = NEGATION_REASON
+    result.answer += ("\n\nBut the note it cites lists this for that day: “%s” [E%d]. "
+                      "Check the note." % (line, label))
+    return hit
+
+
 def plain_status(status, reason, citations):
     """One line David can read on the phone, instead of the engineering reason."""
     reason = reason or ""
     if status == "supported":
         line = "Supported by the cited note"
     elif status == "incomplete":
-        if "entailment unverified" in reason:
+        if reason == NEGATION_REASON:
+            line = "Not verified: the answer says nothing is on, but the cited note lists that day"
+        elif "entailment unverified" in reason:
             line = "Not verified (no automatic fact-check yet)"
         elif "without citing" in reason:
             line = "Not verified: no source cited"
@@ -1029,6 +1067,7 @@ class Service:
             result = answer.ask(asked, profile=self.profile, model=model,
                                 vault=self.vault, limit=self.limit,
                                 prompt=dated_prompt(today, found))
+            check_dated_negation(result, [d for _, ds in found for d in ds])
             cites = self._citations(result)  # renumbers result.answer, so it goes first
             if found and result.answer:
                 # Always state the date the question was resolved to, whatever the answer

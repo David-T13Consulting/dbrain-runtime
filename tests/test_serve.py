@@ -1,4 +1,5 @@
 """MVP-phone /ask service: the boundary, not the model (brief MVP-phone, Done when)."""
+import datetime
 import faulthandler
 import http.client
 import json
@@ -1009,3 +1010,78 @@ class FailClosedDateTest(unittest.TestCase):
                 self.assertTrue(self._unclear(q % w), q % w)
         self.assertEqual([serve.fmt_day(d) for _, ds in self._found("Climbing on 6 May?") for d in ds],
                          ["Wed 6 May 2026"])  # under six months back: this year
+
+
+class DatedNegationTest(unittest.TestCase):
+    """P2.5 F2 on the phone path: the verdict, its reason code, the status line, and the
+    row added below the model's answer, which is kept (David, 13 Oct)."""
+
+    class Chunk:
+        def __init__(self, text, heading="Choir 2026"):
+            self.text, self.heading = text, heading
+
+    ROW = "| Sat 10 Oct | Normal rehearsal | 10:00-12:00 |"
+
+    def result(self, text, status=answer.INCOMPLETE, code=answer.UNVERIFIED):
+        hits = [(1.0, self.Chunk("| Date | Event | Time |\n|---|---|---|\n" + self.ROW))]
+        return answer.Result("q", status, text, [], hits, reason="r", reason_code=code)
+
+    def test_a_cited_bare_no_becomes_a_defect_and_keeps_the_answer(self):
+        for status, code in ((answer.INCOMPLETE, answer.UNVERIFIED),
+                             (answer.WITHHELD, answer.DECLINED)):
+            r = self.result("Nothing found for Sat 10 Oct 2026 [E1].", status, code)
+            self.assertIsNotNone(serve.check_dated_negation(r, [datetime.date(2026, 10, 10)]))
+            self.assertEqual((r.status, r.reason_code), (answer.INCOMPLETE, answer.NEGATION_VS_DATED))
+            self.assertEqual(r.answer, "Nothing found for Sat 10 Oct 2026 [E1].\n\nBut the note "
+                             "it cites lists this for that day: “Sat 10 Oct · Normal rehearsal · "
+                             "10:00-12:00” [E1]. Check the note.")
+            self.assertEqual(serve.plain_status(r.status, r.reason, []),
+                             "Not verified: the answer says nothing is on, but the cited note "
+                             "lists that day")
+
+    def test_left_alone_undated_uncited_no_evidence_or_positive(self):
+        sat10 = [datetime.date(2026, 10, 10)]
+        cases = [(self.result("Nothing found [E1]."), []),
+                 (self.result("Nothing found for Sat 10 Oct 2026."), sat10),
+                 (self.result("No supporting evidence.", answer.WITHHELD, answer.NO_EVIDENCE), sat10),
+                 (self.result("Normal rehearsal, 10:00-12:00 [E1]."), sat10),
+                 (self.result("Nothing found [E7]."), sat10),
+                 (self.result("No rehearsal [E1]."), sat10)]
+        for r, days in cases:
+            before = (r.status, r.reason_code, r.answer)
+            self.assertIsNone(serve.check_dated_negation(r, days))
+            self.assertEqual((r.status, r.reason_code, r.answer), before)
+
+    def test_only_exact_offered_ids_count(self):
+        """F2 D74 consult (13 Oct): "E01" or "E١" is not E1, and silences the check."""
+        for text in ("Nothing found for Sat 10 Oct 2026 [E01].",
+                     "Nothing found for Sat 10 Oct 2026 [E\u0661].",
+                     "Nothing found for Sat 10 Oct 2026 [E1] [E2]."):
+            r = self.result(text)
+            self.assertIsNone(serve.check_dated_negation(r, [datetime.date(2026, 10, 10)]), text)
+            self.assertEqual(r.answer, text)
+
+    def test_the_answer_is_kept_byte_for_byte(self):
+        r = self.result("Nothing found for Sat 10 Oct 2026 [E1].  \n")
+        serve.check_dated_negation(r, [datetime.date(2026, 10, 10)])
+        self.assertTrue(r.answer.startswith("Nothing found for Sat 10 Oct 2026 [E1].  \n\n"))
+
+    def test_only_the_cited_chunk_gives_the_row_and_the_phone_renumbers_it(self):
+        class Cited(self.Chunk):
+            def cite(self):
+                return "Choir.md:1-3"
+        tempting = Cited("| Date | Event | Time |\n|---|---|---|\n"
+                         "| Sat 10 Oct | Normal rehearsal | 10:00-12:00 |")
+        other = Cited("| Date | Event | Time |\n|---|---|---|\n| Sat 10 Oct | Concert | 20:00 |")
+        hits = [(1.0, tempting), (0.9, other)]
+        r = answer.Result("q", answer.INCOMPLETE, "Nothing found for Sat 10 Oct 2026 [E2].", [],
+                          hits, reason="r", reason_code=answer.UNVERIFIED)
+        self.assertEqual(serve.check_dated_negation(r, [datetime.date(2026, 10, 10)]),
+                         (2, "| Sat 10 Oct | Concert | 20:00 |"))
+        serve.Service._citations(r)
+        self.assertEqual(r.answer, "Nothing found for Sat 10 Oct 2026 [1].\n\nBut the note it "
+                         "cites lists this for that day: “Sat 10 Oct · Concert · 20:00” [1]. "
+                         "Check the note.")
+        r = answer.Result("q", answer.INCOMPLETE, "Nothing found for Sat 10 Oct 2026 [E2].", [],
+                          hits[:1], reason="r", reason_code=answer.UNVERIFIED)
+        self.assertIsNone(serve.check_dated_negation(r, [datetime.date(2026, 10, 10)]))

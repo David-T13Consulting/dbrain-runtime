@@ -14,6 +14,7 @@ Supplying a verifier is T4.1 / P2.1 work. Until then the service never claims su
 it cannot demonstrate.
 """
 import re
+import unicodedata
 
 from . import adapter as adapter_mod
 from . import config, index, retrieve
@@ -41,7 +42,9 @@ UNVERIFIED = "unverified"                # incomplete: cited and grounded, no ve
 VERIFIER_REJECTED = "verifier_rejected"  # incomplete: a verifier said unsupported
 VERIFIED = "verified"                    # supported
 MODEL_UNAVAILABLE = "model_unavailable"  # failed (trace only): no reply from the model
-DEFECTS = frozenset({INVALID_CITATION, NO_CITATION, LOW_GROUNDING, VERIFIER_REJECTED})
+NEGATION_VS_DATED = "negation_vs_dated_evidence"  # incomplete: said no, a cited line lists an event that day
+DEFECTS = frozenset({INVALID_CITATION, NO_CITATION, LOW_GROUNDING, VERIFIER_REJECTED,
+                     NEGATION_VS_DATED})
 
 PROMPT = """You answer only from the evidence below, about David's own notes.
 
@@ -85,6 +88,226 @@ GROUNDING_THRESHOLD = 0.15
 def _declines(text):
     low = text.lower()
     return any(phrase in low for phrase in DECLINE_PHRASES)
+
+
+# P2.5 F2 (part of layer 7, D120): the phone said "nothing on that day" while the note it
+# cited lists an event on that day (7 and 9 Oct). A deterministic check, English and French
+# only (D121): pure, no I/O, no model call. Narrow by design (D74 consult and David, 13 Oct,
+# session 47): free text cannot be read safely, so it fires only when the whole answer is a
+# bare "nothing on <the asked day>" and a chunk the answer itself cites holds a clean table
+# row for that day. Everything else is left alone; a miss is safe, a wrong fire is not, and
+# when it fires the phone keeps the model's answer and adds the row (serve.py).
+_F2_MONTHS = (
+    ("jan", "january", "janvier", "janv"), ("feb", "february", "février", "fevrier", "févr", "fevr"),
+    ("mar", "march", "mars"), ("apr", "april", "avril", "avr"), ("may", "mai"),
+    ("jun", "june", "juin"), ("jul", "july", "juillet", "juil"),
+    ("aug", "august", "août", "aout"), ("sep", "sept", "september", "septembre"),
+    ("oct", "october", "octobre"), ("nov", "november", "novembre"),
+    ("dec", "december", "décembre", "decembre", "déc"))
+_F2_WEEKDAYS = (("mon", "monday", "lun", "lundi"), ("tue", "tues", "tuesday", "mar", "mardi"),
+                ("wed", "wednesday", "mer", "mercredi"),
+                ("thu", "thur", "thurs", "thursday", "jeu", "jeudi"),
+                ("fri", "friday", "ven", "vendredi"), ("sat", "saturday", "sam", "samedi"),
+                ("sun", "sunday", "dim", "dimanche"))
+
+
+def _f2_alt(words):
+    return "|".join(sorted(map(re.escape, words), key=len, reverse=True))
+
+
+# Any four-digit number may be a year (1885, 2105: F2 D74 consult, 13 Oct).
+_F2_YEAR = re.compile(r"(?<!\d)\d{4}(?!\d)")
+# Words that make a row or the chunk's prose doubtful: negation, cancellation, a change, a
+# deadline, a template, "to be confirmed". Any of them and the check stays silent.
+_F2_DOUBT = re.compile(
+    r"n't\b|\bn'\s*\w|\b(?:no|not|none|nothing|never|cannot|unable|cancel+ed|cancel|closed|"
+    r"off|postponed|moved|replaced|deadline|due|book|booking|register|registration|sign-up|"
+    r"template|example|tbc|tbd|maybe|optional|cancellations?|suspended|holidays?|vacation|"
+    r"break|free|vacant|nil|n/a|updated|created|modified|last|"
+    r"non|pas|plus|aucun|aucune|rien|sans|jamais|néant|annulations?|suspendu[e]?s?|vacances|congés?|"
+    r"férié[e]?s?|libre|mis à jour|créé[e]?|modifié[e]?|révisé[e]?|dernière?|"
+    r"annul[ée]e?s?|ferm[ée]e?s?|relâche|report[ée]e?s?|déplac[ée]e?s?|supprim[ée]e?s?|"
+    r"remplac[ée]e?s?|échéance|limite|inscriptions?|réservations?|exemple|modèle|"
+    r"facultatif|facultative|peut-être|withdrawn|abolished|scrapped|dropped|aborted|void|"
+    r"deferred|ajourn\w*|rescinded|scrubbed|résili\w*|axed|décommand\w*|"
+    r"déprogramm\w*|retiré[e]?s?|abandonn\w*)\b|\bto be confirmed\b|à confirmer|\?|~~|"
+    r"<(?:del|s|strike)\b", re.I)
+# Numbers in words (a year written out, "the eleventh"), EN and FR.
+_F2_NUMBER_WORDS = (
+    r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\w+teen|\w+teenth|"
+    r"twenty|thirty|twentieth|thirtieth|hundred|thousand|first|second|third|fourth|fifth|"
+    r"sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|deux|trois|quatre|cinq|sept|huit|"
+    r"neuf|dix|onze|douze|treize|quatorze|quinze|seize|vingt|trente|cent|cents|mille|"
+    r"premier|première|\w+ième")
+_F2_NUMBER = re.compile(r"\b(?:%s)\b" % _F2_NUMBER_WORDS, re.I)
+# Words in an event cell that may name the event's own day, so the row's date cell may not
+# be it: a weekday or month, a relative day, a number in words (F2 reviews of session 48,
+# 13 Oct: "Rehearsal on Sunday the eleventh of October", "the day after", "surlendemain").
+_F2_OTHER_DAY = re.compile(
+    r"\b(?:%s|today|tonight|tomorrow|yesterday|next|following|previous|week|weekend|after|"
+    r"before|later|earlier|eve|aujourd'hui|demain|hier|lendemain|surlendemain|veille|"
+    r"avant-veille|après|avant|plus tard|suivante?s?|prochaine?s?|précédente?s?|semaine|"
+    r"week-end|fortnight|quinzaine|%s)\b"
+    % (_f2_alt({w for n in _F2_MONTHS + _F2_WEEKDAYS for w in n}), _F2_NUMBER_WORDS), re.I)
+# What an event cell may hold once its times are removed: letters and plain punctuation.
+# Anything else (a symbol such as ❌ or ✓, a digit) and the check stays silent. A search for
+# one forbidden character, so its cost stays linear in the cell's length.
+_F2_NOT_PLAIN = re.compile(r"[^\w\s'\-–—,.;:()&/+]|[\d_]")
+# The header of the date's column: the date must be the row's date, not a logging date.
+_F2_DATE_HEADER = re.compile(r"dates?|days?|when|jours?|quand", re.I)
+
+
+# A time: 10:00, 10h, 10h00. Not "10.10", which may be a date (F2 review 1, 13 Oct).
+_F2_TIME = re.compile(r"(?<![\d/.:])\d{1,2}(?::\d{2}|h(?:\d{2})?)(?![\d/.:])", re.I)
+
+
+_F2_ISO = re.compile(r"(?<!\d)(\d{4})-\d{2}-\d{2}(?!\d)")
+_F2_ANY_MONTH = _f2_alt({w for m in _F2_MONTHS for w in m})
+_F2_ANY_WEEKDAY = _f2_alt({w for n in _F2_WEEKDAYS for w in n})
+_F2_WORD_DATE = re.compile(
+    r"(?:(?:%(wd)s)\.?,?\s+)?(?:le\s+)?(?<!\d)(?P<d1>\d{1,2})(?:er)?\.?\s+(?:%(mo)s)\b\.?"
+    r"(?:,?\s+(?P<y1>\d{4}))?(?!\d)"
+    r"|(?:(?:%(wd)s)\.?,?\s+)?(?:%(mo)s)\b\.?\s+(?<!\d)(?P<d2>\d{1,2})(?:,?\s+(?P<y2>\d{4}))?(?!\d)"
+    % {"wd": _F2_ANY_WEEKDAY, "mo": _F2_ANY_MONTH}, re.I)
+
+
+def _f2_numbers_accounted(text, year):
+    """Every number in a cited chunk is one F2 understands, or the check stays silent: an
+    ISO date or a written date (EN/FR) in the asked year or with no year, the asked year
+    alone, or a time. Allowed, not forbidden, so an unforeseen spelling of another day or
+    year ("11 / 10 / 20", "Sun 11 Oct 20", "11⁄10⁄20") cannot slip through; any numeric
+    character other than ASCII 0-9 ("¹¹", "₂₀", "²⁰²⁰") also silences it (F2 D74 consult,
+    15 Oct, session 49)."""
+    if any(unicodedata.category(ch)[0] == "N" and ch not in "0123456789" for ch in text):
+        return False
+
+    def iso(m):
+        return " " if int(m.group(1)) == year else "0"  # a digit left over: silent
+
+    def word_date(m):
+        d, y = m.group("d1") or m.group("d2"), m.group("y1") or m.group("y2")
+        return " " if 1 <= int(d) <= 31 and (y is None or int(y) == year) else "0"
+
+    text = _F2_ISO.sub(iso, text)
+    text = _F2_TIME.sub(" ", text)
+    text = _F2_WORD_DATE.sub(word_date, text)
+    text = re.sub(r"(?<!\d)%d(?!\d)" % year, " ", text)
+    return not re.search(r"\d", text)
+
+
+def _f2_norm(text):
+    text = (text or "").replace("’", "'").replace("‘", "'").replace(" ", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _f2_day(day, weekday_needed=False):
+    """A regex for `day` written as a date alone: an optional weekday (only `day`'s own),
+    the day and month (EN or FR, either order), an optional year (only `day`'s own), or
+    ISO. With `weekday_needed`, the weekday or the year must be there."""
+    wd = _f2_alt(_F2_WEEKDAYS[day.weekday()])
+    mo = _f2_alt(_F2_MONTHS[day.month - 1])
+    d, y = r"0?%d" % day.day, r"%d" % day.year
+    lead = r"(?:%s)\.?,?\s+" % wd
+
+    def forms(w, yr):  # day-month and month-day, with weekday part `w` and year part `yr`
+        return [r"%s(?:le\s+)?%s(?:er)?\.?\s+(?:%s)\.?%s" % (w, d, mo, yr % r"\s+"),
+                r"%s(?:%s)\.?\s+%s%s" % (w, mo, d, yr % r",?\s+")]
+
+    iso = r"%d-%02d-%02d" % (day.year, day.month, day.day)
+    if not weekday_needed:
+        return "(?:%s)" % "|".join(forms("(?:%s)?" % lead, "(?:%%s%s)?" % y) + [iso])
+    # Each form spells the weekday or the year as a part of its own, not by a lookahead:
+    # "mar" is both March and mardi (F2 D74 consult, 13 Oct).
+    return "(?:%s)" % "|".join(forms(lead, "(?:%%s%s)?" % y)
+                               + forms("(?:%s)?" % lead, "%%s%s" % y) + [iso])
+
+
+def _f2_bare_denial(text, day):
+    """The whole answer, citations aside, is one "nothing on <day>" sentence."""
+    date = _f2_day(day)
+    body = (r"(?:there\s+is\s+)?nothing\s+(?:is\s+)?(?:found|scheduled|planned|listed)\s+"
+            r"(?:for|on)\s+{d}"
+            r"|there\s+are\s+no\s+(?:events|entries)\s+(?:(?:scheduled|planned|listed)\s+)?"
+            r"(?:for|on)\s+{d}"
+            r"|(?:il\s+n'y\s+a\s+)?rien\s+(?:de\s+prévu|de\s+programmé|n'est\s+prévu|trouvé|"
+            r"n'a\s+été\s+trouvé)\s+(?:pour\s+le|pour|le)\s+{d}"
+            r"|aucun\s+événement\s+(?:n'est\s+)?(?:prévu\s+)?(?:pour\s+le|le)\s+{d}").format(d=date)
+    whole = (r"(?:{d}\s*:\s*)?(?:(?:no|non)\s*[,.]\s*)?(?:{b})"
+             r"(?:\s+(?:in\s+the\s+(?:notes|evidence)|dans\s+les\s+notes))?\s*\.?").format(d=date, b=body)
+    return re.fullmatch(whole, _f2_norm(CITE.sub(" ", text or "")), re.I) is not None
+
+
+def _f2_cells(line):
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _f2_row(line, header, cell_date):
+    """A clean table row for the day: one cell is the date alone (with its weekday or its
+    year), under a Date/Day/Jour column of the table's `header`; every other cell is plain
+    words (times aside) naming no other day, and one holds an event word; nothing doubtful."""
+    if _F2_DOUBT.search(line):
+        return False
+    cells = _f2_cells(line)
+    dated = [i for i, c in enumerate(cells) if cell_date.fullmatch(c)]
+    if len(dated) != 1 or dated[0] >= len(header) \
+            or not _F2_DATE_HEADER.fullmatch(header[dated[0]]):
+        return False
+    rest = [_F2_TIME.sub(" ", c).strip() for i, c in enumerate(cells) if i != dated[0]]
+    # A digit, a symbol, or a word that may name another day ("11/10", "❌", "Sunday the
+    # eleventh") could mean the event is not on the row's date: stay silent (F2 reviews).
+    if any(c and (_F2_NOT_PLAIN.search(c) or _F2_OTHER_DAY.search(c)) for c in rest):
+        return False
+    return any(re.search(r"[^\W\d_]{3,}", c) for c in rest)
+
+
+def dated_contradiction(answer_text, cited, days):
+    """The first cited table row for the asked day that a bare "nothing on that day" answer
+    contradicts, as (label, row); else None.
+
+    `cited`: (label, chunk text) for each chunk the answer cites; `days`: the dates the
+    question was resolved to (exactly one, or the check stays silent). A chunk counts only
+    if the asked year appears in it and no other (a chunk split off under a heading may have
+    lost its note's year: F2 D74 consult, 13 Oct), and none of its lines outside the table
+    rows (prose and header rows) is doubtful (`_F2_DOUBT`) or holds a digit other than the
+    asked year or a time ("'20": F2 review 1 of session 48)."""
+    if len(days) != 1 or not _f2_bare_denial(answer_text, days[0]):
+        return None
+    day = days[0]
+    cell_date = re.compile(_f2_day(day, weekday_needed=True), re.I)
+    own_year = re.compile(r"(?<!\d)%d(?!\d)" % day.year)
+    for label, chunk in cited:
+        lines = [_f2_norm(raw) for raw in (chunk or "").splitlines() if raw.strip()]
+        years = {int(y) for y in _F2_YEAR.findall(" ".join(lines))}
+        # A two-digit year anywhere, in prose or any row ("October '20", "11/10/20"), silences
+        # it too (F2 reviews 3 and 4 of session 48).
+        if years != {day.year} or re.search(r"'\d{2}(?!\d)|(?<!\d)\d{1,2}[/.-]\d{1,2}[/.-]\d{2}(?!\d)",
+                                            " ".join(lines)):
+            continue
+        if not _f2_numbers_accounted("\n".join(lines), day.year):
+            continue
+        # Tables: a header row, its separator, then body rows. Rows under no header are not
+        # read as rows; they count as prose.
+        rows, prose, header = [], [], None
+        for i, line in enumerate(lines):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if line.startswith("|") and re.fullmatch(r"\|[\s:|-]+\|?", nxt):
+                header = _f2_cells(line)
+                prose.append(line)
+            elif line.startswith("|") and re.fullmatch(r"\|[\s:|-]+\|?", line):
+                continue
+            elif line.startswith("|") and header is not None:
+                rows.append((line, header))
+            else:
+                header = None
+                prose.append(line)
+        # A year may be written in words ("two thousand twenty": F2 review 2 of session 48).
+        if any(_F2_DOUBT.search(x) or _F2_NUMBER.search(x)
+               or re.search(r"\d", _F2_TIME.sub(" ", own_year.sub(" ", x))) for x in prose):
+            continue
+        for line, head in rows:
+            if _f2_row(line, head, cell_date):
+                return label, line
+    return None
 
 
 def grounding_overlap(answer_text, cited_chunks):
