@@ -82,9 +82,11 @@ def nearest_rank(values, q):
     return ordered[max(1, math.ceil(q * len(ordered))) - 1]
 
 
-def code_hashes():
-    """The executed pipeline: this runner, the dev-case loader and every dbrain module."""
-    files = [Path(__file__).resolve(), HERE / "run_dev_cases.py"] + sorted((HERE / "dbrain").glob("*.py"))
+def code_hashes(extra=()):
+    """The executed pipeline: this runner, the dev-case loader and every dbrain module, plus
+    `extra` (a runner built on this one, T9b)."""
+    files = ([Path(__file__).resolve(), HERE / "run_dev_cases.py"] + [Path(f).resolve() for f in extra]
+             + sorted((HERE / "dbrain").glob("*.py")))
     return {str(f.relative_to(HERE)): sha256(f) for f in files}
 
 
@@ -114,14 +116,29 @@ def machine_state():
 
 # --- child mode: one block's warm-up and cases, run inside the sandbox ------------------
 
-def child(report_path, warmup_only=False):
+class CappedAdapter(adapter_mod.LlamaCppAdapter):
+    """T9b: one token cap for every request (answer.ask calls generate with the default)."""
+
+    def __init__(self, cap, **kw):
+        super().__init__(**kw)
+        self.cap = cap
+
+    def generate(self, prompt, max_tokens=320):
+        return super().generate(prompt, self.cap)
+
+
+def child(report_path, warmup_only=False, max_tokens=320, timeout=CASE_TIMEOUT, extra_code=()):
     """Warm-up, then the 10 dev cases in order. Every case gets a row with its elapsed time,
-    whatever happens: a malformed reply or a timeout is an outcome, not a crash."""
+    whatever happens: a malformed reply or a timeout is an outcome, not a crash. The
+    defaults are T9's; T9b passes its configuration's token cap and request timeout."""
     profile = config.DEVCASES
     cases = run_dev_cases.load_dev_cases()
     chunks, files = index.build(profile)
-    model = adapter_mod.LlamaCppAdapter(endpoint="http://127.0.0.1:%d" % PORT,
-                                        timeout=CASE_TIMEOUT)
+    endpoint = "http://127.0.0.1:%d" % PORT
+    if max_tokens == 320:
+        model = adapter_mod.LlamaCppAdapter(endpoint=endpoint, timeout=timeout)
+    else:
+        model = CappedAdapter(max_tokens, endpoint=endpoint, timeout=timeout)
 
     def one(question):
         started = time.time()
@@ -143,7 +160,7 @@ def child(report_path, warmup_only=False):
             if "returned non-JSON" in str(exc):
                 # The server answered, but not with JSON: a malformed reply, not an outage.
                 row.update(status="malformed", reason=type(exc).__name__)
-            elif elapsed >= CASE_TIMEOUT - 1 or "timed out" in str(exc):
+            elif elapsed >= timeout - 1 or "timed out" in str(exc):
                 row.update(status="timeout", reason=type(exc).__name__)
             else:
                 row.update(status="unavailable", reason=type(exc).__name__)
@@ -152,10 +169,10 @@ def child(report_path, warmup_only=False):
         row["corpus_version_after"] = run_dev_cases.corpus_version(index.build(profile)[0])
         return row
 
-    report = {"case_order": [c["id"] for c in cases], "code": code_hashes(),
+    report = {"case_order": [c["id"] for c in cases], "code": code_hashes(extra_code),
               "cases_pin": cases_pin(cases),
               "corpus_version": run_dev_cases.corpus_version(chunks), "corpus_files": files,
-              "request_signature": adapter_mod.request_signature(answer.PROMPT)}
+              "request_signature": adapter_mod.request_signature(answer.PROMPT, max_tokens)}
     report["warmup_started"] = time.time()
     report["warmup"] = one(WARMUP)
     report["cases_started"] = time.time()
@@ -175,6 +192,12 @@ def child(report_path, warmup_only=False):
 # --- parent: the protocol -----------------------------------------------------------------
 
 class Run:
+    # The protocol's shape; T9b overrides these four (class attributes, so T9 is unchanged).
+    order = ORDER
+    drift_positions = DRIFT_POSITIONS
+    scored_baseline_positions = SCORED_BASELINE_POSITIONS
+    baseline_key = "B0"
+
     def __init__(self, label, cooldown, models, evidence, manifest):
         self.label, self.cooldown, self.models, self.ev = label, cooldown, models, evidence
         self.manifest = manifest
@@ -210,13 +233,20 @@ class Run:
             time.sleep(0.5)
         return False
 
-    def version_problems(self, data, warmup_only=False):
+    def request_signature_for(self, key):
+        return self.manifest["request_signature"]
+
+    def child_argv(self, key, report, warmup_only):
+        return ([sys.executable, str(Path(__file__).resolve()), "--child", str(report)]
+                + (["--warmup-only"] if warmup_only else []))
+
+    def version_problems(self, data, warmup_only=False, key=None):
         """Code, corpus, request or cases differing from the manifest void the whole run."""
         m = self.manifest
         problems = []
         if data.get("code") != m["code"]:
             problems.append("executed code differs from the manifest")
-        if data.get("request_signature") != m["request_signature"]:
+        if data.get("request_signature") != self.request_signature_for(key):
             problems.append("request signature differs from the manifest")
         if data.get("cases_pin") != m["cases_pin"] or data.get("case_order") != m["case_order"]:
             problems.append("dev cases differ from the manifest")
@@ -287,9 +317,7 @@ class Run:
             else:
                 report = self.ev / ("%s-dev-cases.json" % tag)
                 started = time.time()
-                res = subprocess.run(self.sandboxed_argv([sys.executable, str(Path(__file__).resolve()),
-                                                          "--child", str(report)]
-                                                         + (["--warmup-only"] if warmup_only else [])),
+                res = subprocess.run(self.sandboxed_argv(self.child_argv(key, report, warmup_only)),
                                      env=clean_env(), cwd=str(HERE), capture_output=True, text=True)
                 record.update(block_seconds=round(time.time() - started, 1), exit=res.returncode,
                               stdout_tail=res.stdout[-800:], stderr_tail=res.stderr[-800:],
@@ -299,7 +327,7 @@ class Run:
                 else:
                     data = json.loads(report.read_text())
                     record.update(report=report.name, warmup=data.get("warmup", {}).get("status"))
-                    invalid = self.version_problems(data, warmup_only)
+                    invalid = self.version_problems(data, warmup_only, key)
                     problems = invalid + self.check_report(data, warmup_only)
                     if not record["server_alive_after"]:
                         problems.append("model server exited during the block")
@@ -379,24 +407,24 @@ class Run:
     def go(self):
         drift_affected = False
         prev_baseline = 1
-        for position, key in enumerate(ORDER, 1):
+        for position, key in enumerate(self.order, 1):
             self.scored[position] = self.block(position, key)
-            if position in DRIFT_POSITIONS and self.drifted(self.scored[position]):
+            if position in self.drift_positions and self.drifted(self.scored[position]):
                 # Re-run once the blocks since the previous baseline, then this baseline.
                 for p in range(prev_baseline + 1, position):
-                    self.scored[p] = self.block(p, ORDER[p - 1], "drift re-run")
+                    self.scored[p] = self.block(p, self.order[p - 1], "drift re-run")
                 self.scored[position] = self.block(position, key, "drift re-run")
                 if self.drifted(self.scored[position]):
                     drift_affected = True
-            if key == "B0":
+            if key == self.baseline_key:
                 prev_baseline = position
         return self.summary(drift_affected)
 
     def summary(self, drift_affected):
         per_model = {}
-        for position, key in enumerate(ORDER, 1):
-            if key == "B0" and position not in SCORED_BASELINE_POSITIONS:
-                continue  # position 5: drift check only
+        for position, key in enumerate(self.order, 1):
+            if key == self.baseline_key and position not in self.scored_baseline_positions:
+                continue  # T9 position 5, T9b position 4: drift check only
             per_model.setdefault(key, []).append(self.blocks[self.scored[position]])
         out = {"label": self.label, "drift_affected": drift_affected,
                "protocol_cooldown": self.cooldown == COOLDOWN,
