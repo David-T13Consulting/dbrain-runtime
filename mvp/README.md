@@ -1,7 +1,11 @@
 # MVP-phone: ask the second brain from the iPhone
 
 Brief: `90 System/briefs/MVP-phone.md` in the vault (David's Q32–Q34). On `main`.
-Read-only: the service reads the whole vault minus dot-folders. A note with no
+Read-only: the service reads the whole vault minus dot-folders and minus the system's own
+working notes (P2.8, D133): `90 System/`, `10 Projects/AI Second Brain/`, the agents'
+orchestration record in `40 Archive/`, `AGENTS.md`, `CLAUDE.md`, `index.md` and `log.md`
+(`config.SYSTEM_NOTES`). They quote test questions word for word and outranked the notes the
+questions are about. Everything else, all of `00 Inbox/` included, stays in. A note with no
 `classification`, an unrecognised one (`restricted`) or frontmatter it cannot verify is
 skipped and traced, never indexed; the other notes still answer. A note with a recognisable
 `client` label, or conflicting labels, is not skipped: it **pauses** the service (every
@@ -42,7 +46,10 @@ iPhone Shortcut ── Tailscale (WireGuard) ──▶ this Air: dbrain.serve :8
    - Ask for Input (text; dictation works from the keyboard).
    - Get Contents of URL: `http://<air-name>.<tailnet>.ts.net:8765/ask`, method POST,
      header `Authorization: Bearer <token>`, request body JSON with key `question`.
-   - Get Dictionary Value `display` › Show Result (optionally Speak Text).
+   - Get Dictionary Value `display` › Show Result (optionally Speak Text). Since P2.8 the
+     `display` is plain text: the answer, each source as its note's title with one quoted
+     line, one status line, and the time only past 8 s. Paths and line numbers stay in the
+     JSON (`citations`).
    - `GET …:8765/health` (no token) reports whether the service and the model are up.
      With the Air asleep nothing answers and the Shortcut hangs: Shortcuts has no client
      timeout, and David accepted this on the Air host (Q36).

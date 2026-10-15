@@ -24,6 +24,7 @@ it adds is the boundary:
 tell "the Air is offline or asleep" from "the brain has no answer".
 """
 import argparse
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -36,6 +37,7 @@ import socket
 import sys
 import threading
 import time
+import unicodedata
 import urllib.request
 from collections import OrderedDict
 from datetime import date, datetime, timedelta
@@ -43,7 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import adapter as adapter_mod
-from . import aliases, answer, config, index, outpath, trace
+from . import aliases, answer, config, index, outpath, scope, trace
 from . import failures as failures_mod
 
 # Payload key carrying the verdict's reason code from Service.ask to the capture point;
@@ -721,22 +723,240 @@ def plain_status(status, reason, citations):
     return line
 
 
-def display_text(payload):
-    """One plain-text block for the Shortcut's Show Result / Speak Text."""
-    lines = [payload.get("answer") or "(no answer)"]
+# P2.8 B1: the phone shows plain text. Evidence ids, single or grouped ("[E1, E4]"), are
+# never shown; nor are markdown tables, bold markers or note paths (D133).
+_ASKED = re.compile(r"^\(Asked about (?P<day>[^()]*)\.\) ")
+_ID_GROUP = re.compile(r"\[\s*E\s*\d+(?:\s*[,;]\s*E?\s*\d+)*\s*\]", re.I)
+# Only the suffix goes: removing a whole path token also took any sentence glued to it
+# (B1 review 1, finding 3). A folder name may stay; the brief accepts that.
+_MD_SUFFIX = re.compile(r"\.md\b(?::\d+(?:[-–]\d+)?)?", re.I)
+_DATED_STEM = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[- ]\d{4})?[- ]*")
+LATENCY_SHOWN_ABOVE = 8.0  # D56: the latency is news only past the target
+TITLE_MAX = 80
+QUOTE_WIDTH = 160  # quote_lines' width; the screen never cuts a quote again (B1 review 1)
+NO_QUOTE = "    (no line of this note can be shown here)"
+
+
+def _phone_line(line):
+    s = line.strip()
+    if s.startswith("|"):  # a table row: its cells; a separator row: nothing
+        if set(s) <= set("|-: "):
+            return ""
+        s = " · ".join(cell.strip() for cell in s.strip("|").split("|") if cell.strip())
+    s = re.sub(r"^#+\s*", "", s)
+    return re.sub(r"^(?:[-*+•]|\d+[.)])\s+", "", s)
+
+
+def _guard(s):
+    """The screen's promise, by construction: one pass, and no replacement can create
+    another forbidden token (B1 review 1, finding 2)."""
+    s = s.replace("|", "·")
+    s = re.sub(r"\[(?=\s*E)", "(", s, flags=re.I)
+    s = re.sub(r"\.(md)", r" \1", s, flags=re.I)  # glued too: ".mdx", ".md_backup"
+    return re.sub(r"\*{2,}", "*", s)
+
+
+def _visible(text):
+    """True if a reader would see something: a letter, digit, mark of punctuation or
+    symbol, not only spaces or zero-width characters (B1 D74 consult)."""
+    return any(unicodedata.category(c)[0] in "LNPS" for c in text or "")
+
+
+def phone_text(text):
+    """Model or note text as one plain line for the phone. Never drops a sentence: lines
+    are joined, not filtered, so a sentence the service appended always survives."""
+    # Format characters go first, so removing one can never join a forbidden token
+    # ("*\u200b*"); splitlines also breaks on U+2028 and the other Unicode line ends.
+    text = "".join(c for c in text or "" if unicodedata.category(c) != "Cf")
+    lines = [_phone_line(l) for l in text.splitlines()]
+    s = " ".join(l for l in lines if l).replace("`", " ")
+    for _ in range(10):  # tidy until stable; _guard below is what guarantees the screen
+        before = s
+        s = _ID_GROUP.sub("", s)
+        s = _MD_SUFFIX.sub("", s)
+        s = s.replace("**", "").replace("__", "")
+        if s == before:
+            break
+    s = re.sub(r"\s+([.,;:!?])", r"\1", _guard(s))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _stems(text):
+    return {w[:5] for w in _words(text)}  # "Thursday" and "Thursdays" meet
+
+
+# Markdown structure lines, never content (B1 review 3, session 50): a table's delimiter
+# row with or without outer pipes ("|---|", "--- | :--:", tabs too, and a bare "---"),
+# a setext underline ("==="), a thematic break ("***", "_ _ _"), a code fence.
+_DELIMITER = re.compile(r"\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*")
+_SETEXT = re.compile(r"=+[ \t]*")
+_BREAK = re.compile(r"([*_-])(?:[ \t]*\1){2,}[ \t]*")
+_FENCE = re.compile(r"(?:`{3,}|~{3,})")
+
+
+def _is_separator(line):
+    """A line that is only markdown structure."""
+    return bool(_DELIMITER.fullmatch(line) or _SETEXT.fullmatch(line)
+                or _BREAK.fullmatch(line) or _FENCE.match(line))
+
+
+# B1 review 4 and its D74 consult (session 50): markdown containers and comments. A line's
+# container prefixes ("> ", list and task markers) are removed to a fixed point before it is
+# classified; HTML and Obsidian comments, tag-only lines, link-reference and footnote
+# definitions and callout heads ("[!note]") are structure. Forms outside this set are an
+# accepted residual (David, Q117): they may show a structure line; nothing else changes.
+_CONTAINER = re.compile(r"(?:>[ \t]?|[-*+][ \t]+|\d+[.)][ \t]+|\[[ xX]\][ \t]+)")
+_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)|%%.*?(?:%%|\Z)", re.S)
+_TAG_ONLY = re.compile(r"(?:<[^<>]*>[ \t]*)+")
+_DEFINITION = re.compile(r"\[\^?[^\]]+\]:.*|\[![^\]]*\].*")
+
+
+def _blank_comments(text):
+    """Comments become blank lines (line count kept). A "-->" with no opening in the chunk
+    closes a comment that began above it: everything up to it is blanked too."""
+    head, sep, rest = text.partition("-->")
+    if sep and "<!--" not in head:
+        text = re.sub(r"[^\n]", "", head) + " " * len(sep) + rest
+    return _COMMENT.sub(lambda m: re.sub(r"[^\n]", "", m.group(0)), text)
+
+
+def _unwrap(line):
+    """A line without format characters and container prefixes. Prefixes go one at a
+    time, and a thematic break is kept whole ("- - -" is not a list item)."""
+    s = "".join(c for c in line if unicodedata.category(c) != "Cf").strip()
+    while s and not _BREAK.fullmatch(s):
+        m = _CONTAINER.match(s)
+        if not m:
+            break
+        s = s[m.end():].strip()
+    return s
+
+
+def _normalised(line):
+    """`_unwrap`ped line, "" if blank, None if it is only structure."""
+    s = _unwrap(line)
+    if s and (s.startswith("#") or _is_separator(s) or _TAG_ONLY.fullmatch(s)
+              or _DEFINITION.fullmatch(s)):
+        return None
+    return s
+
+
+def _content_lines(chunk_text):
+    """(index, normalised line) for a chunk's content lines: no blank line, heading,
+    structure line, comment, leading frontmatter block, nor a line directly above a
+    delimiter or underline (a table's header row, a setext heading), all judged after
+    `_normalised`. A line holding "|" above a pipe delimiter after blank lines counts as a
+    header too, to exclude more."""
+    raw = _blank_comments(chunk_text or "").splitlines()
+    norm = [_normalised(l) for l in raw]
+    skip = set()
+    if norm and raw[0].strip() == "---":  # frontmatter at the top of a note's first chunk
+        end = next((j for j in range(1, len(raw)) if raw[j].strip() in ("---", "...")), None)
+        if end is not None:
+            skip.update(range(end + 1))
+
+    def underline(j):
+        line = _unwrap(raw[j])
+        return bool(_DELIMITER.fullmatch(line) or _SETEXT.fullmatch(line))
+
+    out = []
+    for i, line in enumerate(norm):
+        if i in skip or not line:
+            continue
+        if i + 1 < len(norm) and underline(i + 1):
+            continue
+        later = next((j for j in range(i + 1, len(norm)) if norm[j] != ""), None)
+        if "|" in line and later is not None and underline(later) and "|" in raw[later]:
+            continue
+        out.append((i, line))
+    return out
+
+
+def screen_line(chunk_text, answer_text):
+    """The one line of a cited chunk the phone shows under its title (B1; review 2 of
+    session 50: the JSON's first quote could be a table's header row and hide the row
+    that contradicts the answer). Never a heading, a table separator or a header row,
+    which name things rather than state them. The line sharing most words with the
+    answer, then most word stems ("Thursday", "Thursdays"), the earliest on a tie; with
+    nothing shared, the first body line; "" if no line has anything to show. Cut raw at
+    the JSON quote's width before clean-up, so clean-up can never hide its end. The
+    JSON's `quote` is not touched."""
+    plain = phone_text(answer_text)
+    words, stems = _words(plain), _stems(plain)
+    best, first = None, ""
+    for _, bare in _content_lines(chunk_text):
+        shown = phone_text(_cut(bare, QUOTE_WIDTH))
+        if not _visible(shown):
+            continue
+        first = first or shown
+        score = (len(_words(shown) & words), len(_stems(shown) & stems))
+        if any(score) and (best is None or score > best[0]):
+            best = (score, shown)
+    return best[1] if best else first
+
+
+def _stem_title(path):
+    name = path.rsplit("/", 1)[-1]
+    if name.lower().endswith(".md"):
+        name = name[:-3]
+    name = _DATED_STEM.sub("", name).replace("-", " ").replace("_", " ")
+    return phone_text(name) or "a note"
+
+
+def note_title(raw, path):
+    """The note's first `# ` heading, else its file name made readable."""
+    body = raw or ""
+    if body.startswith("---"):
+        end = body.find("\n---", 3)
+        body = body[end + 4:] if end != -1 else ""
+    for line in body.splitlines():
+        if line.startswith("# "):
+            title = phone_text(line[2:])
+            if title:
+                return _cut(title, TITLE_MAX)
+            break
+    return _stem_title(path)
+
+
+def _cut(text, limit):
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def display_text(payload, titles=(), lines_shown=()):
+    """One plain-text block for the Shortcut's Show Result / Speak Text (P2.8 B1): the
+    answer, starting with the fact; each source by title with exactly one line from it, so
+    a contradiction stays visible (acceptance fix 2, kept by David, Q109): `lines_shown[n]`
+    (`screen_line`, which the service always passes; empty means NO_QUOTE, never the JSON
+    quote, which may be a table header: B1 review 3), else for a caller passing no lines
+    the first showable JSON quote, else NO_QUOTE; one status line; the latency only past the target. Paths and line
+    numbers stay in the JSON."""
+    raw = payload.get("answer") or ""
+    asked = _ASKED.match(raw)
+    body = phone_text(raw[asked.end():] if asked else raw)
+    if asked:
+        day = phone_text(asked["day"])
+        short = re.sub(r" \d{4}$", "", day)
+        if not body.startswith(short):
+            body = "%s: %s" % (day, body) if body else day
+    lines = [body if _visible(body) else "(no answer)"]
     cites = payload.get("citations", [])
     if cites:
         lines.append("")
-        lines.append("From your notes:")
         for n, c in enumerate(cites, 1):
-            tag = " (unreviewed Inbox note)" if c["unreviewed"] else ""
-            lines.append("[%d] %s, lines %s%s" % (n, c["path"], c["lines"], tag))
-            for q in c.get("quote", []):
-                lines.append("    “%s”" % q)
+            title = titles[n - 1] if n <= len(titles) else _stem_title(c.get("path", ""))
+            title = phone_text(title)
+            lines.append("[%d] %s" % (n, title if _visible(title) else "a note"))
+            if n <= len(lines_shown):
+                quote = phone_text(lines_shown[n - 1])
+            else:
+                quote = next((q for q in map(phone_text, c.get("quote") or ()) if _visible(q)), "")
+            lines.append("    “%s”" % quote if _visible(quote) else NO_QUOTE)
     lines.append("")
-    lines.append(payload.get("status_line") or payload["status"])
-    lines.append("%.1f s" % payload["latency_s"])
-    return "\n".join(lines)
+    lines.append(phone_text(payload.get("status_line") or payload.get("status") or ""))
+    latency = payload.get("latency_s")
+    if isinstance(latency, (int, float)) and latency > LATENCY_SHOWN_ABOVE:
+        lines.append("%.1f s" % latency)
+    return "\n".join(_guard(line) for line in lines)
 
 
 def error_display(code):
@@ -759,10 +979,15 @@ def error_display(code):
     }.get(code, "Request failed (%d)." % code)
 
 
+def _label(m):
+    digits = m.group(1)
+    return int(digits) if len(digits) <= 6 else None  # an absurd id is never a source
+
+
 def _renumber(answer_text, label_to_n):
     """[E3] -> [2]: number sources as the phone lists them; drop ids it does not list."""
     def sub(m):
-        n = label_to_n.get(int(m.group(1)))
+        n = label_to_n.get(_label(m))
         return "[%d]" % n if n else ""
     return re.sub(r"\s+(?=\[E\d+\])", " ", CITE_ID.sub(sub, answer_text)).replace("  ", " ").strip()
 
@@ -918,14 +1143,35 @@ class Service:
             return False
         return hmac.compare_digest(header[len("Bearer "):].strip().encode("utf-8"), self._token)
 
+    def titles(self, citations, files):
+        """Each cited note's title for the phone (B1). The note is read once more and its
+        heading used only if those bytes are the ones this query indexed (`files`: path ->
+        SHA-256, after the label check); a note changed since, or unreadable, shows its
+        file name, which the JSON already carries (B1 review 1: a reread must not bypass
+        the label check). Never fails an answer."""
+        out = []
+        for c in citations:
+            path = c.get("path", "")
+            raw = ""
+            try:
+                text = scope.read_text(path, self.profile, self.vault)
+                if hmac.compare_digest(hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                                       files.get(path) or ""):
+                    raw = text
+            except (scope.ScopeError, OSError, UnicodeError, ValueError):
+                pass
+            out.append(note_title(raw, path))
+        return out
+
     @staticmethod
     def _citations(result):
         """Cited sources in the order the phone shows them, each with its quoted line(s),
-        and the answer's [En] ids renumbered to match that order."""
+        and the answer's [En] ids renumbered to match that order. Also returns each
+        source's screen line (`screen_line`), in the same order; it never enters the JSON."""
         by_label = {i: c for i, (_, c) in enumerate(result.hits, 1)}
         order, label_to_n = [], {}
         for m in CITE_ID.finditer(result.answer or ""):
-            label = int(m.group(1))
+            label = _label(m)
             chunk = by_label.get(label)
             if chunk is None or label in label_to_n:
                 continue
@@ -936,13 +1182,14 @@ class Service:
                 continue
             order.append((cite, chunk))
             label_to_n[label] = len(order)
-        out = []
+        out, shown = [], []
         for cite, chunk in order:
             c = citation(cite)
             c["quote"] = quote_lines(chunk.text, result.answer or "")
             out.append(c)
+            shown.append(screen_line(chunk.text, result.answer or ""))
         result.answer = _renumber(result.answer or "", label_to_n)
-        return out
+        return out, shown
 
     def ask_within(self, question, started, answer_id=None):
         """`ask` under the end-to-end deadline (step 5): `started` is when the request
@@ -1066,12 +1313,14 @@ class Service:
             payload["display"] = display_text(payload)
             return 200, payload
         asked = aliases.expand(asked, self.aliases)  # P2.5 F3
+        shown, titles = [], []  # display-only (B1); none on the error paths
         try:
             result = answer.ask(asked, profile=self.profile, model=model,
                                 vault=self.vault, limit=self.limit,
                                 prompt=dated_prompt(today, found))
             check_dated_negation(result, [d for _, ds in found for d in ds])
-            cites = self._citations(result)  # renumbers result.answer, so it goes first
+            cites, shown = self._citations(result)  # renumbers result.answer: first
+            titles = self.titles(cites, result.files)
             if found and result.answer:
                 # Always state the date the question was resolved to, whatever the answer
                 # says (Codex consultation, session 20): it sets the context next to the
@@ -1108,7 +1357,7 @@ class Service:
         payload["latency_s"] = round(time.time() - started, 2)
         payload["status_line"] = plain_status(payload["status"], payload["reason"],
                                               payload["citations"])
-        payload["display"] = display_text(payload)
+        payload["display"] = display_text(payload, titles, shown)
         if self.tracing and result is not None:
             try:
                 trace.write(result, model, self.profile, answer_id=answer_id)

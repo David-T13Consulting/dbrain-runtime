@@ -225,7 +225,7 @@ class AcceptanceFixesTest(AskEndpointTest):
         """Fix 1: no engineering jargon on the phone."""
         self.model.reply = "Tempo runs happen on Thursdays [E1]"
         _, body = self.request("POST", "/ask", {"question": "When do tempo runs happen Thursdays?"})
-        last_lines = body["display"].splitlines()[-2]
+        last_lines = body["display"].splitlines()[-1]  # latency hidden under 8 s (P2.8 B1)
         for jargon in ("lexical", "entailment", "overlap", "%", "verifier", "incomplete"):
             self.assertNotIn(jargon, last_lines)
         self.assertTrue(last_lines.startswith("Not verified"))
@@ -233,7 +233,8 @@ class AcceptanceFixesTest(AskEndpointTest):
         self.assertIn("reason", body)  # the technical reason stays in the JSON
 
     def test_source_lines_are_quoted_verbatim_under_the_answer(self):
-        """Fix 2: the note's own words sit under the answer, so a contradiction shows."""
+        """Fix 2: the note's own words sit under the answer, so a contradiction shows. Since
+        P2.8 B1 one quoted line per source, under the note's title (David, Q109)."""
         self.model.reply = "Tempo runs happen on Thursdays [E1]"
         _, body = self.request("POST", "/ask", {"question": "When do tempo runs happen Thursdays?"})
         self.assertIn("“Tempo runs happen on Thursdays.”", body["display"])
@@ -450,7 +451,8 @@ class DateAwarenessTest(unittest.TestCase):
         svc, _ = self._service("There is no school on Nov 2. [E1]")
         _, body = svc.ask("What's on the menu tomorrow?")
         self.assertTrue(body["answer"].startswith("(Asked about Tue 6 Oct 2026.)"), body["answer"])
-        self.assertIn("Asked about Tue 6 Oct 2026", body["display"])
+        self.assertTrue(body["display"].startswith("Tue 6 Oct 2026: There is no school"),
+                        body["display"])
 
     def test_no_relative_date_means_no_date_rule(self):
         svc, model = self._service("Tempo is marathon pace [E1]")
@@ -987,7 +989,7 @@ class FailClosedDateTest(unittest.TestCase):
             svc, _ = self._service()
             _, body = svc.ask(q)
             self.assertTrue(body["answer"].startswith("(Asked about %s.)" % label), (q, body["answer"]))
-            self.assertIn("(Asked about %s.)" % label, body["display"], q)
+            self.assertTrue(body["display"].startswith(label + ": "), (q, body["display"]))
 
     def test_every_smoke_question_still_reads(self):
         """The real-model smoke questions (experiments/mvp_smoke.py) keep their dates: none
