@@ -735,6 +735,10 @@ LATENCY_SHOWN_ABOVE = 8.0  # D56: the latency is news only past the target
 TITLE_MAX = 80
 QUOTE_WIDTH = 160  # quote_lines' width; the screen never cuts a quote again (B1 review 1)
 NO_QUOTE = "    (no line of this note can be shown here)"
+# P2.8 B2 (David, Q110): a withheld answer never shows the model's sentence, which is often
+# a decline phrase inside a partly right answer ("not specified"); its cited lines do.
+NO_CLEAR = "No clear answer. Closest in your notes:"
+NOTHING = "Nothing in your notes matches"
 
 
 def _phone_line(line):
@@ -922,24 +926,34 @@ def _cut(text, limit):
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def display_text(payload, titles=(), lines_shown=()):
+def display_text(payload, titles=(), lines_shown=(), question="", day=""):
     """One plain-text block for the Shortcut's Show Result / Speak Text (P2.8 B1): the
     answer, starting with the fact; each source by title with exactly one line from it, so
     a contradiction stays visible (acceptance fix 2, kept by David, Q109): `lines_shown[n]`
     (`screen_line`, which the service always passes; empty means NO_QUOTE, never the JSON
     quote, which may be a table header: B1 review 3), else for a caller passing no lines
-    the first showable JSON quote, else NO_QUOTE; one status line; the latency only past the target. Paths and line
-    numbers stay in the JSON."""
+    the first showable JSON quote, else NO_QUOTE; one status line; the latency only
+    past the target. Paths and line numbers stay in the JSON. A `withheld` answer (B2,
+    Q110) shows no model sentence: NO_CLEAR above its sources, or with none cited NOTHING
+    and the question; `day`, the service's resolved date label, leads when given. It is
+    never read from the answer text, which the model can write (B2 review 1)."""
     raw = payload.get("answer") or ""
     asked = _ASKED.match(raw)
-    body = phone_text(raw[asked.end():] if asked else raw)
-    if asked:
-        day = phone_text(asked["day"])
-        short = re.sub(r" \d{4}$", "", day)
-        if not body.startswith(short):
-            body = "%s: %s" % (day, body) if body else day
-    lines = [body if _visible(body) else "(no answer)"]
     cites = payload.get("citations", [])
+    if payload.get("status") == "withheld":
+        q = phone_text(question)
+        body = NO_CLEAR if cites else (NOTHING + (": “%s”" % q if _visible(q) else "."))
+        label = phone_text(day)
+        if _visible(label):
+            body = "%s: %s" % (label, body)
+    else:
+        body = phone_text(raw[asked.end():] if asked else raw)
+        if asked:
+            day = phone_text(asked["day"])
+            short = re.sub(r" \d{4}$", "", day)
+            if not body.startswith(short):
+                body = "%s: %s" % (day, body) if body else day
+    lines = [body if _visible(body) else "(no answer)"]
     if cites:
         lines.append("")
         for n, c in enumerate(cites, 1):
@@ -1314,6 +1328,7 @@ class Service:
             return 200, payload
         asked = aliases.expand(asked, self.aliases)  # P2.5 F3
         shown, titles = [], []  # display-only (B1); none on the error paths
+        label = days_label([d for _, ds in found for d in ds]) if found else ""
         try:
             result = answer.ask(asked, profile=self.profile, model=model,
                                 vault=self.vault, limit=self.limit,
@@ -1357,7 +1372,7 @@ class Service:
         payload["latency_s"] = round(time.time() - started, 2)
         payload["status_line"] = plain_status(payload["status"], payload["reason"],
                                               payload["citations"])
-        payload["display"] = display_text(payload, titles, shown)
+        payload["display"] = display_text(payload, titles, shown, question, label)
         if self.tracing and result is not None:
             try:
                 trace.write(result, model, self.profile, answer_id=answer_id)

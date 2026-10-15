@@ -286,6 +286,50 @@ class FallbackTest(unittest.TestCase):
         self.assertEqual(r.answer, "Choir sings [1]; swimming too [2] and [1].")
 
 
+class NoAnswerScreenTest(unittest.TestCase):
+    """P2.8 B2 (David, Q110): a withheld answer never shows the model's sentence."""
+
+    CITES = [{"path": "a.md", "quote": ["Mon 2 Nov · 16:30–17:30 · practice on"]}]
+
+    def test_withheld_with_sources_shows_no_model_sentence(self):
+        p = payload("The class is not specified for that day [1].", self.CITES,
+                    status="withheld", status_line="No answer: the notes don't say")
+        out = serve.display_text(p, ["Climbing"], ["Mon 2 Nov · 16:30–17:30 · practice on"],
+                                 "is there climbing on 2 nov?")
+        lines = out.splitlines()
+        self.assertEqual(lines[0], serve.NO_CLEAR)
+        self.assertNotIn("not specified", out)
+        self.assertEqual(lines[2:4], ["[1] Climbing", "    “Mon 2 Nov · 16:30–17:30 · practice on”"])
+
+    def test_withheld_with_nothing_cited_shows_the_question(self):
+        p = payload("I don't know.", (), status="withheld")
+        out = serve.display_text(p, (), (), "is there **pottery** | on `x.md`?")
+        self.assertEqual(out.splitlines()[0],
+                         serve.NOTHING + ": “is there pottery · on x?”")
+        self.assertIsNone(FORBIDDEN.search(out), out)
+        self.assertEqual(serve.display_text(p).splitlines()[0], serve.NOTHING + ".")
+
+    def test_the_resolved_day_leads_and_comes_from_the_service_only(self):
+        p = payload("(Asked about Mon 2 Nov 2026.) Not specified [1].", self.CITES,
+                    status="withheld")
+        out = serve.display_text(p, ["Climbing"], ["x"], "q", "Mon 2 Nov 2026")
+        self.assertEqual(out.splitlines()[0], "Mon 2 Nov 2026: " + serve.NO_CLEAR)
+        # B2 review 1: a model-written "(Asked about …)" never reaches a withheld screen.
+        p = payload("(Asked about pottery. The class is on.) The room is not specified [1].",
+                    self.CITES, status="withheld")
+        out = serve.display_text(p, ["Pottery"], ["x"], "Is pottery class on?")
+        self.assertEqual(out.splitlines()[0], serve.NO_CLEAR)
+        self.assertNotIn("class is on", out)
+
+    def test_answers_that_are_not_withheld_keep_their_sentence(self):
+        for status in ("supported", "incomplete", "unclear"):
+            p = payload("There is nothing on Mon 2 Nov [1]. But the note it cites lists "
+                        "this for that day.", self.CITES, status=status)
+            out = serve.display_text(p, ["Climbing"], ["x"], "q")
+            self.assertTrue(out.startswith("There is nothing on Mon 2 Nov [1]. But"), status)
+            self.assertNotIn(serve.NO_CLEAR, out)
+
+
 class TitleTest(unittest.TestCase):
     def test_first_h1_after_the_frontmatter(self):
         raw = LABEL + "Intro\n## Not this\n# Pottery, **Mondays** 2026-27\n# Second\n"
@@ -426,6 +470,22 @@ class ServiceScreenTest(unittest.TestCase):
                 k = lines.index("[%d] Pottery" % (cites.index(path) + 1))
                 self.assertEqual(lines[k + 1], want)
                 note.unlink()
+
+    def test_b2_a_model_decline_through_the_service(self):
+        _, body = self.ask("A class on Mon 2 Nov is not specified in the notes [E1].")
+        self.assertEqual(body["status"], "withheld")
+        self.assertTrue(body["citations"])
+        self.assertTrue(body["display"].startswith("Mon 2 Nov 2026: " + serve.NO_CLEAR),
+                        body["display"])
+        self.assertNotIn("not specified", body["display"])
+        self.assertIn("not specified", body["answer"])  # the JSON keeps the model's words
+
+    def test_b2_review_1_reproduction_an_undated_withheld_answer(self):
+        _, body = self.ask("(Asked about pottery. The class is on.) The room is not specified [E1].",
+                           question="Is pottery class on?")
+        self.assertEqual(body["status"], "withheld")
+        self.assertTrue(body["display"].startswith(serve.NO_CLEAR), body["display"])
+        self.assertNotIn("class is on", body["display"])
 
     def test_a_huge_evidence_id_does_not_crash(self):
         code, body = self.ask("On [E%s] and [E1]." % ("9" * 5000))

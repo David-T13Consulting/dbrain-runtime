@@ -49,7 +49,9 @@ iPhone Shortcut ── Tailscale (WireGuard) ──▶ this Air: dbrain.serve :8
    - Get Dictionary Value `display` › Show Result (optionally Speak Text). Since P2.8 the
      `display` is plain text: the answer, each source as its note's title with one quoted
      line, one status line, and the time only past 8 s. Paths and line numbers stay in the
-     JSON (`citations`).
+     JSON (`citations`). A withheld answer shows no model sentence: "No clear answer.
+     Closest in your notes:" above its sources, or "Nothing in your notes matches" and the
+     question when nothing was cited (P2.8 B2).
    - `GET …:8765/health` (no token) reports whether the service and the model are up.
      With the Air asleep nothing answers and the Shortcut hangs: Shortcuts has no client
      timeout, and David accepted this on the Air host (Q36).
