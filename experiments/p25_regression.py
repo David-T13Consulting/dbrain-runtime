@@ -97,7 +97,20 @@ def load_cases(path=None):
                 raise SystemExit("case %s: asked term %r names another activity" % (case["id"], w))
         if case["type"] == "row" and not (case.get("expect_start") and case.get("absent_terms")):
             raise SystemExit("row case %s needs `expect_start` and `absent_terms`" % case["id"])
+    alias_table(doc)  # refuses a malformed table early
     return doc
+
+
+def alias_table(doc):
+    """P2.5 F3: the case file's synthetic alias table, in `aliases.expand`'s form. Used only
+    with --aliases; the real table (`aliases.ALIASES`) never meets the synthetic notes."""
+    table = {}
+    for entry in doc.get("retrieval_aliases", []):
+        words, says = entry.get("words"), entry.get("notes_say")
+        if not (words and says and all(isinstance(w, str) and w for w in words + says)):
+            raise SystemExit("retrieval alias %r needs `words` and `notes_say`" % (entry,))
+        table[tuple(words)] = tuple(says)
+    return table
 
 
 # -- the claim grammar ------------------------------------------------------------------
@@ -430,14 +443,17 @@ def _ask(service, question):
     }
 
 
-def run(doc, model, dev=False, dev_cases=None):
+def run(doc, model, dev=False, dev_cases=None, use_aliases=False):
+    """`use_aliases`: the case file's synthetic alias table (F3); else none, the baseline."""
     today = date.fromisoformat(doc["today"])
+    table = alias_table(doc) if use_aliases else {}
     root = build_vault(doc["notes"])
     try:
         profile = config.Profile("p25-synthetic", roots=("",), exclude_hidden=True,
                                  skip_unlabelled=True)
         svc = serve.Service(TOKEN, model_factory=lambda: model, profile=profile, vault=root,
                             tracing=False, today=lambda: today)
+        svc.aliases = table
         rows = []
         for case in doc["cases"]:
             row = dict(case, **_ask(svc, case["question"]))
@@ -451,6 +467,7 @@ def run(doc, model, dev=False, dev_cases=None):
         "today": doc["today"],
         "model": model.describe(),
         "prompt_template": serve.dated_prompt(today, []),
+        "aliases": [[list(k), list(v)] for k, v in table.items()],
         "cases": rows,
         "by_type": by_type(rows),
     }
@@ -458,6 +475,7 @@ def run(doc, model, dev=False, dev_cases=None):
     if dev:
         svc = serve.Service(TOKEN, model_factory=lambda: model, profile=config.DEVCASES,
                             tracing=False, today=lambda: today)
+        svc.aliases = table
         report["dev"] = [dict(id=c["id"], question=c["question"], **_ask(svc, c["question"]))
                          for c in dev_cases]
     return report
@@ -506,7 +524,8 @@ def rescore(old, doc):
         row["score"] = score(case, row["status"], row["answer"], doc)
         row["answer_sha256"] = answer_sha256(row["status"], row["answer"])
         rows.append(row)
-    report = {k: old[k] for k in ("generated", "today", "model", "prompt_template", "dev") if k in old}
+    report = {k: old[k] for k in ("generated", "today", "model", "prompt_template", "aliases", "dev")
+              if k in old}
     report.update(cases=rows, by_type=by_type(rows), rescored=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
     adjudicate(report)
     return report
@@ -535,6 +554,8 @@ def main(argv=None):
     ap.add_argument("--compare", default=None, help="an earlier report to compare with")
     ap.add_argument("--cases", default=None)
     ap.add_argument("--rescore", default=None, help="score a saved report's answers again")
+    ap.add_argument("--aliases", action="store_true",
+                    help="P2.5 F3: expand questions with the case file's synthetic alias table")
     args = ap.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9._-]+", args.label):
         raise SystemExit("label: letters, digits, dot, dash, underscore only")
@@ -551,7 +572,8 @@ def main(argv=None):
     if args.dev:
         import run_dev_cases  # the reserved acceptance cases stay refused there
         dev_cases = run_dev_cases.load_dev_cases()
-    report = run(load_cases(args.cases), model, dev=args.dev, dev_cases=dev_cases)
+    report = run(load_cases(args.cases), model, dev=args.dev, dev_cases=dev_cases,
+                 use_aliases=args.aliases)
     return _finish(args, report)
 
 

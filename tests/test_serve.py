@@ -1085,3 +1085,39 @@ class DatedNegationTest(unittest.TestCase):
         r = answer.Result("q", answer.INCOMPLETE, "Nothing found for Sat 10 Oct 2026 [E2].", [],
                           hits[:1], reason="r", reason_code=answer.UNVERIFIED)
         self.assertIsNone(serve.check_dated_negation(r, [datetime.date(2026, 10, 10)]))
+
+
+class AliasExpansionTest(unittest.TestCase):
+    """P2.5 F3: the phone appends an alias's note wording to the question before retrieval,
+    so a note that never uses the asked word is found (synthetic note and table)."""
+
+    TODAY = datetime.date(2026, 10, 9)
+
+    def _service(self):
+        vault = whole_vault_fixture()
+        (vault / "20 Areas/Hobbies/hiking.md").parent.mkdir(parents=True, exist_ok=True)
+        (vault / "20 Areas/Hobbies/hiking.md").write_text(
+            "---\nclassification: internal\n---\n# Hiking club\n\n| Date | Event | Time |\n"
+            "|---|---|---|\n| Sat 10 Oct | Normal outing | 14:00-17:30 |\n")
+        model = adapter.StubAdapter(reply="Sat 10 Oct: Normal outing, 14:00-17:30 [E1]")
+        svc = serve.Service(TOKEN, model_factory=lambda: model, vault=vault,
+                            tracing=False, today=lambda: self.TODAY)
+        return svc, model
+
+    def test_an_alias_finds_the_note_that_never_uses_the_word(self):
+        svc, model = self._service()
+        svc.aliases = {("trailblazers",): ("hiking", "outing")}
+        svc.ask("Trailblazers?")  # undated: no date form can find the note instead
+        self.assertIn("(also: hiking, outing)", model.calls[0])
+        self.assertIn("Normal outing", model.calls[0])  # retrieval found the hiking note
+
+    def test_without_the_alias_the_note_is_not_found(self):
+        svc, model = self._service()
+        svc.aliases = {}
+        _, body = svc.ask("Trailblazers?")
+        self.assertEqual(model.calls, [])  # no evidence, so no model call
+        self.assertNotIn("(also:", body.get("answer", ""))
+
+    def test_the_service_uses_the_real_table_by_default(self):
+        svc, _ = self._service()
+        self.assertIs(svc.aliases, __import__("dbrain.aliases").aliases.ALIASES)

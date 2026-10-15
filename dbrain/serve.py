@@ -43,7 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import adapter as adapter_mod
-from . import answer, config, index, outpath, trace
+from . import aliases, answer, config, index, outpath, trace
 from . import failures as failures_mod
 
 # Payload key carrying the verdict's reason code from Service.ask to the capture point;
@@ -910,6 +910,8 @@ class Service:
         self.failures = failures
         # P2.7 step C5: recent answers for a "wrong" tap, in memory only (§7a v0.8).
         self.recent = RecentAnswers()
+        # P2.5 F3: David's words -> his notes' wording, appended before retrieval.
+        self.aliases = aliases.ALIASES
 
     def authorised(self, header):
         if not header or not header.startswith("Bearer "):
@@ -1063,6 +1065,7 @@ class Service:
             payload["status_line"] = plain_status("unclear", "", [])
             payload["display"] = display_text(payload)
             return 200, payload
+        asked = aliases.expand(asked, self.aliases)  # P2.5 F3
         try:
             result = answer.ask(asked, profile=self.profile, model=model,
                                 vault=self.vault, limit=self.limit,

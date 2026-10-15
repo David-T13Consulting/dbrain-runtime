@@ -1,5 +1,11 @@
 {
  "about": "P2.5 slice F0-F3: regression cases for 'the row exists but the answer says no'. Synthetic notes and questions only: no wording from David's phone, no children, names or places. Asked through the phone path on a fixed test date. The hiking club's group name (Trailblazers) is never written in its note, like a word only its members use. Ground truth per case: the asked `activity` and `date`; for a row case its `expect_start` and the `absent_terms` the note does not use; `asked_terms` are the question's words for the event. `activities` lists the words that may name each activity in an answer; `facts` is every calendar row of the notes (a `none` row says there is no event). An alias listed under an activity's `specific` names that one calendar event; any other alias names the activity in general.",
+ "retrieval_aliases": [
+  {"words": ["trailblazers", "trailblazer"], "notes_say": ["hiking", "outing"]},
+  {"words": ["cantata", "cantatas"], "notes_say": ["choir", "rehearsal"]},
+  {"words": ["chorale"], "notes_say": ["choir", "rehearsal"]},
+  {"words": ["vocal"], "notes_say": ["choir", "rehearsal"]}
+ ],
  "today": "2026-10-09",
  "notes": {
   "20 Areas/Hobbies/choir-2026-27.md": "---\nclassification: internal\n---\n# Choir: 2026-2027\n\n**Normal rehearsal:** Saturday 10:00-12:00 at the community hall.\n\n## Calendar\n| Date | Event | Time |\n|---|---|---|\n| Sat 3 Oct | Normal rehearsal | 10:00-12:00 |\n| Sat 10 Oct | Normal rehearsal | 10:00-12:00 |\n| Sat 17 Oct | No rehearsal (autumn break) | - |\n| Sat 24 Oct | Dress rehearsal for the concert | 09:00-13:00 |\n| Sat 7 Nov | Normal rehearsal | 10:00-12:00 |\n| Sat 21 Nov | Normal rehearsal | 10:00-12:00 |\n",
