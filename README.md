@@ -27,6 +27,10 @@ carrying file paths and line ranges:
 - **incomplete** — cited nothing, invented an id, or wandered off its own citation
 - **withheld** — nothing retrieved, or the model itself declined
 
+The `default` and `devcases` profiles read a **frozen copy** of their three files as the
+C2 baseline read them on 8 Oct (`evidence/`, Q138), not the live vault, so every model is
+measured on the same evidence. The phone profile reads the live vault.
+
 ## The boundary
 
 `dbrain/scope.py` is the only way the service reads the vault. The invariant is blunt on

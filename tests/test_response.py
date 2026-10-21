@@ -71,6 +71,30 @@ class DevcasesCorpusTest(unittest.TestCase):
             }, p.name)
             self.assertIn("10 Projects/AI Second Brain/04_Roadmap.md", p.sections)
 
+    def test_the_frozen_corpus_is_byte_for_byte_what_c2_read(self):
+        """Q136/Q138: the dev cases read the 8 Oct corpus, not the live vault."""
+        import hashlib
+        import run_dev_cases
+        from dbrain import index
+        # Copied from artifacts/q84-c2-2026-10-08/dev-cases.json ("corpus"), git-ignored.
+        record = {"version": "878a08ea6f57", "chunk_count": 27, "files": {
+            "AGENTS.md":
+                "80fbffaae6b2ab659b5838f287fcc0a62c6c282a1405578ed8a95d1ba2964833",
+            "10 Projects/AI Second Brain/02_Architecture/data-policy.md":
+                "6cd8f0f8f6865636f1a765acd9791029efb5ef095f4d76aebfd84b187e97c207",
+            "10 Projects/AI Second Brain/04_Roadmap.md":
+                "6edd0c1c29df4a320aac3e6fe488bb68eeecae3f52bb448b252ac26ea0d6dede"}}
+        for p in (config.DEFAULT, config.DEVCASES):
+            self.assertEqual(p.vault, config.DEVCASE_CORPUS, p.name)
+            chunks, files = index.build(p)
+            self.assertEqual(run_dev_cases.corpus_version(chunks), record["version"], p.name)
+            self.assertEqual(len(chunks), record["chunk_count"], p.name)
+        for rel, digest in record["files"].items():
+            data = (config.DEVCASE_CORPUS / rel).read_bytes()
+            self.assertEqual(hashlib.sha256(data).hexdigest(), digest, rel)
+        # The phone profile still reads the live vault.
+        self.assertIsNone(config.MVP_WHOLE_VAULT.vault)
+
 
     def test_an_empty_or_thinking_only_answer_fails(self):
         """Round D finding 4: no answer text is not a bad answer, it is no answer."""

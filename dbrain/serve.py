@@ -1168,7 +1168,9 @@ class Service:
             path = c.get("path", "")
             raw = ""
             try:
-                text = scope.read_text(path, self.profile, self.vault)
+                # The root index.build used: a frozen profile's own vault when none is set.
+                vault = self.vault if self.vault is not None else getattr(self.profile, "vault", None)
+                text = scope.read_text(path, self.profile, vault)
                 if hmac.compare_digest(hashlib.sha256(text.encode("utf-8")).hexdigest(),
                                        files.get(path) or ""):
                     raw = text

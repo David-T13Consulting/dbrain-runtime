@@ -27,8 +27,11 @@ class Profile:
     """An allowlist. `roots` are directories; `files` are individual notes."""
 
     def __init__(self, name, roots=(), files=(), sections=None, exclude_hidden=False,
-                 skip_unlabelled=False, excludes=()):
+                 skip_unlabelled=False, excludes=(), vault=None):
         self.name = name
+        # A fixed vault root for this profile, used when the caller names none. None:
+        # the live vault (VAULT). Set only for a frozen evidence corpus (DEVCASE_CORPUS).
+        self.vault = vault
         self.roots = tuple(roots)
         self.files = tuple(files)
         # Vault-relative folders or files carved out of the allowlist (P2.8 A1). An entry
@@ -73,11 +76,20 @@ SCOPED_SECTIONS = {
     "10 Projects/AI Second Brain/04_Roadmap.md": ("## 0.", "## 1."),
 }
 
-DEFAULT = Profile("default", files=SCOPED_FILES, sections=SCOPED_SECTIONS)
+# The dev-case corpus is frozen (Q136, refined by Q138, David 21 Oct). The 19 Oct pivot
+# rewrote the roadmap without its section 0, and AGENTS.md and the data policy had already
+# changed after the C2 baseline (8 Oct). These are the three files byte for byte as C2 read
+# them, from vault commit 8990bbe (sha256 per file and corpus version 878a08ea6f57 match
+# artifacts/q84-c2-2026-10-08/dev-cases.json), at their vault-relative paths so citations
+# and the corpus hash are unchanged. Every model is compared on this evidence. Never edit
+# these files; a new corpus is a new folder and a new baseline.
+DEVCASE_CORPUS = Path(__file__).resolve().parent.parent / "evidence" / "devcase-corpus-8990bbe"
+
+DEFAULT = Profile("default", files=SCOPED_FILES, sections=SCOPED_SECTIONS, vault=DEVCASE_CORPUS)
 
 # Kept as a name because run reports since 2 Oct record it. Same allowlist as DEFAULT
 # now that the brief's allowlist *is* the dev-case corpus.
-DEVCASES = Profile("devcases", files=SCOPED_FILES, sections=SCOPED_SECTIONS)
+DEVCASES = Profile("devcases", files=SCOPED_FILES, sections=SCOPED_SECTIONS, vault=DEVCASE_CORPUS)
 
 # The system's own working notes, which the phone must not search (P2.8 A1, D133, 14 Oct).
 # Since 5 Oct they quote test questions almost word for word, so keyword retrieval ranked

@@ -137,6 +137,8 @@ def build(profile, vault=None, skipped=None):
     appended to `skipped` as (path, reason) instead of raising. It is still never
     indexed, so it can never reach the model.
     """
+    if vault is None:
+        vault = getattr(profile, "vault", None)  # a frozen corpus (config.DEVCASE_CORPUS)
     chunks = []
     files = {}
     for parts in scope.iter_allowed_files(profile, vault):
