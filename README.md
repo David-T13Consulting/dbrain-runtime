@@ -64,6 +64,39 @@ a missing or unrecognised label is a refusal, because absence of a label is not 
 There is deliberately no fallback branch in that file. Provider keys are detected only so
 a trace can record that they were ignored; no code path reads their values.
 
+## Rented providers
+
+`dbrain/provider.py` (PV1 step 4, D135) can send a question to a rented model. It is
+**not wired into any entry point yet**: the phone service and `query` stay on the local
+model (stage 1, D141, nothing leaves the Mac). It exists for stage 3.
+
+- **Chosen only by explicit configuration.** `DBRAIN_PROVIDER`, `DBRAIN_LEVEL` and
+  `DBRAIN_PROVIDER_MODEL` must all be set and must all match a closed registry in the
+  code (today: Scaleway, level L1, three model IDs). Unset means the local adapter, as
+  before; half-set is refused. Adding a provider, level or model is a reviewed code
+  change, not configuration.
+- **No fallback.** A provider that is down, redirects, answers malformed or reports a
+  different model raises; nothing retries another provider, model, level or the local
+  model.
+- **The key** is read from the macOS Keychain (`/usr/bin/security`, with a timeout) at
+  each call, never from the environment, never kept on the adapter, never in a message,
+  a trace or `describe()`. No key fails closed before any network call. An answer
+  containing the key is refused.
+- **Error texts are fixed.** Nothing a server sends (error body, redirect target, finish
+  reason) is echoed back, since it could carry the key; exception chains are suppressed.
+- **Egress** goes only to the registry's base URL, over TLS, with ambient proxies stripped
+  and every redirect refused. The endpoint is rebuilt from the registry on every call;
+  no caller can pass a URL. Tests name only a port (`test_port`): host `127.0.0.1`,
+  plain http and the path are fixed in code, and test mode refuses the Keychain, so it
+  needs an injected dummy key.
+- **Bounded:** responses over 2 MB are refused; usage is reported per call, never kept.
+
+**Not detectable:** a provider that silently answers with a successor model **under the
+requested ID**. The adapter refuses an answer whose reported model differs from the
+configured one, but cannot see a substitution the provider does not report (Scaleway
+documents replacing models after end of life). PV1 step 5 records the model list at
+measurement time; a changed list is the only signal.
+
 ## Writes
 
 The read side is guarded by `scope.py`; the write side has its own guard,
