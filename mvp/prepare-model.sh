@@ -44,8 +44,12 @@ if [ ! -x "$DEST/llama/llama-b11146/llama-server" ]; then
     pin "$SRC_ARCHIVE" "$ARCHIVE_PIN"
     tar -xzf "$SRC_ARCHIVE" -C "$DEST/llama"
 fi
-# The default model since Q84 (a), 8 Oct: Gemma 4 E4B QAT Q4_0, fetched under the T9 manifest
+# The default model from Q84 (a), 8 Oct, to Q152, 21 Oct: Gemma 4 E4B QAT Q4_0, fetched under the T9 manifest
 # (models/MANIFEST.md). This script never downloads it; it only checks the pin.
 [ -f "$DEST/models/gemma-4-E4B_q4_0-it.gguf" ] || { echo "missing $DEST/models/gemma-4-E4B_q4_0-it.gguf (see models/MANIFEST.md)" >&2; exit 1; }
 pin "$DEST/models/gemma-4-E4B_q4_0-it.gguf" 676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee
+# The default model since Q152, 21 Oct: Gemma 4 26B-A4B QAT Q4_0, fetched under the T9c manifest
+# (artifacts/t9c-2026-10-21/). E4B above stays as the one-restart fallback.
+[ -f "$DEST/models/gemma-4-26B_q4_0-it.gguf" ] || { echo "missing $DEST/models/gemma-4-26B_q4_0-it.gguf (see the T9c manifest)" >&2; exit 1; }
+pin "$DEST/models/gemma-4-26B_q4_0-it.gguf" 3eca3b8f6d7baf218a7dd6bba5fb59a56ee25fe2d567b6f5f589b4f697eca51d
 echo "ready: $DEST"

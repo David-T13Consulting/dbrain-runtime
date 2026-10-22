@@ -10,9 +10,13 @@ set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 APP="$HOME/Library/Application Support/dbrain"
 SERVER="$APP/llama/llama-b11146/llama-server"
-# Default model: Gemma 4 E4B QAT Q4_0, picked by T9 and adopted by David (Q84 (a), 8 Oct).
-MODEL="$APP/models/gemma-4-E4B_q4_0-it.gguf"
-MODEL_PIN=676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee
+# Default model: Gemma 4 26B-A4B QAT Q4_0 (google, rev d1c082be), picked by T9c and adopted by
+# David (Q152, 21 Oct): 7 of 8 dev cases against C2's 5, same typical latency, ~15 GiB while
+# running. To go back to C2 (Gemma 4 E4B QAT Q4_0, Q84 (a)), swap the two pairs and restart.
+MODEL="$APP/models/gemma-4-26B_q4_0-it.gguf"
+MODEL_PIN=3eca3b8f6d7baf218a7dd6bba5fb59a56ee25fe2d567b6f5f589b4f697eca51d
+# MODEL="$APP/models/gemma-4-E4B_q4_0-it.gguf"
+# MODEL_PIN=676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee
 # Logs outside the vault and outside git (data policy §7b, P2.7 step C3b): config.LOGS,
 # ~/Library/Application Support/dbrain/logs unless DBRAIN_LOGS says otherwise. The service
 # gets the checked absolute path back, so a relative DBRAIN_LOGS cannot resolve elsewhere.
