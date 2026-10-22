@@ -47,6 +47,7 @@ LLAMA_LOOP=$!
     env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u GOOGLE_API_KEY -u GEMINI_API_KEY \
         -u MISTRAL_API_KEY -u COHERE_API_KEY -u HF_TOKEN \
         DBRAIN_LOGS="$LOGS" DBRAIN_FAILURE_CAPTURE="$CAPTURE" \
+        DBRAIN_MODEL="$(basename "$MODEL" .gguf)" \
         PYTHONPATH="$HERE" python3 -m dbrain.outpath exec-logged \
         "$LOGS/ask-$(date +%Y%m%dT%H%M%S).log" python3 -m dbrain.serve
     rc=$?
