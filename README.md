@@ -3,7 +3,8 @@
 A scoped, read-only query service over the Dbrain2 vault. Built for **P2.2**.
 
 Separate from the vault on purpose: the vault holds knowledge, this holds code. David
-authorised this location on 2 Oct 2026. Local git only, never pushed.
+authorised this location on 2 Oct 2026. Pushed to a private GitHub `origin`; whether any
+other backup holds it is not tested (T4.2: `python3 -I -B experiments/restore_test.py runtime`).
 
 ```sh
 ./query "What counts as a tempo session?"        # needs a local model running
