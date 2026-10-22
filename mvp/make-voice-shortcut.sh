@@ -14,6 +14,8 @@
 #
 #   ./mvp/make-voice-shortcut.sh             build, sign and open "Ask Brain" for "Add Shortcut"
 #   ./mvp/make-voice-shortcut.sh --key       build, sign and open "Brain Key" (once, ever)
+#   ./mvp/make-voice-shortcut.sh --text      build, sign and open "Ask Brain Text": typed
+#                                            question, no speech, same screen (David, 21 Oct)
 #   ./mvp/make-voice-shortcut.sh --check     build and sign "Ask Brain" into a temp folder only
 set -euo pipefail
 MODE="${1:-open}"
@@ -76,6 +78,13 @@ actions = [
      "WFWorkflowActionParameters": {"UUID": u_key, "WFWorkflowName": KEY_NAME,
                                     "WFWorkflow": {"workflowName": KEY_NAME, "isSelf": False},
                                     "WFShowWorkflow": False}},
+] + ([
+    # Typed fallback (--text): ask for text, no speech.
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.ask",
+     "WFWorkflowActionParameters": {"UUID": u_dict, "WFAskActionPrompt": "Ask your brain",
+                                    "WFInputType": "Text"}},
+    post(u_ask, "/ask", [("question", var_text(u_dict, "Provided Input"))]),
+] if mode == "--text" else [
     {"WFWorkflowActionIdentifier": "is.workflow.actions.dictatetext",
      "WFWorkflowActionParameters": {"UUID": u_dict, "WFDictateTextStopListening": "After Pause"}},
     post(u_ask, "/ask", [("question", var_text(u_dict, "Dictated Text"))]),
@@ -84,6 +93,7 @@ actions = [
      # Not waiting for speech to finish, so the screen appears while it speaks (David, 21 Oct).
      "WFWorkflowActionParameters": {"WFText": var_text(u_spk, "Dictionary Value"),
                                     "WFSpeakTextWait": False}},
+]) + [
     value(u_dsp, "display", u_ask),
     value(u_id, "answer_id", u_ask),
     # One step (David, 21 Oct): the screen text is the menu's prompt, OK / Wrong below it,
@@ -109,7 +119,11 @@ with open(os.path.join(work, "unsigned.shortcut"), "wb") as f:
     plistlib.dump(wf, f, fmt=plistlib.FMT_BINARY)
 PY
 
-if [ "$MODE" = "--key" ]; then NAME="Brain Key"; else NAME="Ask Brain"; fi
+case "$MODE" in
+  --key) NAME="Brain Key" ;;
+  --text) NAME="Ask Brain Text" ;;
+  *) NAME="Ask Brain" ;;
+esac
 OUT="$WORK/$NAME.shortcut"
 shortcuts sign --mode anyone --input "$WORK/unsigned.shortcut" --output "$OUT"
 echo "Built for http://$HOST:8765 (no token inside)."
@@ -120,9 +134,10 @@ fi
 open "$OUT"
 if [ "$MODE" = "--key" ]; then
   echo "Click 'Add Shortcut'. Then on the iPhone, in Brain Key's one Text action, replace the"
-  echo "placeholder with the whole value copied from Ask Brain 5's header (Bearer and the token)."
+  echo "placeholder with 'Bearer ' followed by the token (mvp/make-token.sh copies the bare"
+  echo "token, so type 'Bearer ' and a space before pasting it)."
 else
-  echo "Click 'Add Shortcut' (replace the old Ask Brain if asked). No paste needed: it calls Brain Key."
+  echo "Click 'Add Shortcut' (replace the old $NAME if asked). No paste needed: it calls Brain Key."
 fi
 printf "Press Enter once added; the temporary file is then deleted. "
 read -r _
