@@ -283,13 +283,37 @@ def _tokens(case, answer, today):
     return " ".join(text.split())
 
 
+def _wrong_month(case, text):
+    """True if the normalised answer names any month but the case's (Tier 1a batch
+    2026-10-22, review 1: "Mar 10, 2026" was read as French "mar" for Tuesday and passed for
+    a 10 November event). "mar" counts as March unless it is the French Tuesday directly
+    before the case's own day and month ("mar 10 nov"). Conservative: "may" or "sept" used
+    as ordinary words also fail the closed form, so such an answer is unscored, never a
+    pass."""
+    d = date.fromisoformat(case["date"])
+    own = set(_MONTHS[d.month])
+    words = text.split()
+    for i, w in enumerate(words):
+        for m, names in _MONTHS.items():
+            if m == d.month or w not in names:
+                continue
+            if (w == "mar" and d.weekday() == 1 and i + 2 < len(words)
+                    and words[i + 1] == str(d.day) and words[i + 2] in own):
+                continue
+            return True
+    return False
+
+
 def closed_form(case, answer, today):
     """True if the answer is one of the whole-answer forms above, with the right start time
     (and end time, as a range) bound to the case's subject. A question is not an
     assertion. Returns (ok, the token sequence) so the report shows what did not fit."""
-    if "?" in (answer or ""):
+    folded = fold(answer or "")
+    if "?" in folded or "¿" in folded:       # after NFKC: full-width and small forms too
         return False, ["a question, not an assertion"]
     text = " %s " % normalise(answer)
+    if _wrong_month(case, text):
+        return False, ["names another month"]
     if not _times_bound(case, text):
         return False, ["start and end times not stated as the right range"]
     seq = _tokens(case, answer, today)
