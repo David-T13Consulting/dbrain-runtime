@@ -926,6 +926,63 @@ def _cut(text, limit):
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _answer_body(payload, question="", day=""):
+    """The answer as one plain line, shared by the screen and the spoken form: the
+    service's own label for a withheld answer (never model text), else the model's
+    answer with the resolved day leading."""
+    raw = payload.get("answer") or ""
+    asked = _ASKED.match(raw)
+    if payload.get("status") == "withheld":
+        q = phone_text(question)
+        body = (NO_CLEAR if payload.get("citations") else
+                (NOTHING + (": “%s”" % q if _visible(q) else ".")))
+        label = phone_text(day)
+        if _visible(label):
+            body = "%s: %s" % (label, body)
+        return body
+    body = phone_text(raw[asked.end():] if asked else raw)
+    if asked:
+        day = phone_text(asked["day"])
+        short = re.sub(r" \d{4}$", "", day)
+        if not body.startswith(short):
+            body = "%s: %s" % (day, body) if body else day
+    return body
+
+
+SPOKEN_TITLES = 3  # sources named aloud; the screen lists them all
+# The evidence state in words (David, Q149, 21 Oct: words now; a calibrated percentage
+# only once T4.1 can back it). Other states say it in their own sentence.
+SPOKEN_CUE = {"supported": "Verified.", "incomplete": "Not sure."}
+
+
+def spoken_text(payload, titles=(), question="", day=""):
+    """What the Shortcut speaks (PL1 step 4): the same answer as the screen, then the
+    sources by title only, at most SPOKEN_TITLES. No quotes, paths, ids or latency: the
+    screen keeps those. Plain text; on-device speech reads it, nothing leaves the Mac."""
+    body = _answer_body(payload, question, day)
+    if not _visible(body):
+        # Nothing to say (a malformed reply): speak the screen's own advice instead.
+        body = phone_text(payload.get("status_line") or "") or "No answer"
+    out = body.rstrip(" :")
+    if out[-1:] not in ".!?":
+        out += "."
+    cites = payload.get("citations", [])
+    cue = SPOKEN_CUE.get(payload.get("status"))
+    if cue:
+        out += " " + cue
+    if any(c.get("unreviewed") for c in cites):
+        out += " From an unreviewed note."
+    names = []
+    for n, c in enumerate(cites[:SPOKEN_TITLES], 1):
+        title = phone_text(titles[n - 1] if n <= len(titles) else _stem_title(c.get("path", "")))
+        names.append(title if _visible(title) else "a note")
+    if names:
+        out += " Source%s: %s." % ("s" if len(names) > 1 else "", "; ".join(names))
+        if len(cites) > SPOKEN_TITLES:
+            out += " And %d more on the screen." % (len(cites) - SPOKEN_TITLES)
+    return _guard(out)
+
+
 def display_text(payload, titles=(), lines_shown=(), question="", day=""):
     """One plain-text block for the Shortcut's Show Result / Speak Text (P2.8 B1): the
     answer, starting with the fact; each source by title with exactly one line from it, so
@@ -937,22 +994,8 @@ def display_text(payload, titles=(), lines_shown=(), question="", day=""):
     Q110) shows no model sentence: NO_CLEAR above its sources, or with none cited NOTHING
     and the question; `day`, the service's resolved date label, leads when given. It is
     never read from the answer text, which the model can write (B2 review 1)."""
-    raw = payload.get("answer") or ""
-    asked = _ASKED.match(raw)
     cites = payload.get("citations", [])
-    if payload.get("status") == "withheld":
-        q = phone_text(question)
-        body = NO_CLEAR if cites else (NOTHING + (": “%s”" % q if _visible(q) else "."))
-        label = phone_text(day)
-        if _visible(label):
-            body = "%s: %s" % (label, body)
-    else:
-        body = phone_text(raw[asked.end():] if asked else raw)
-        if asked:
-            day = phone_text(asked["day"])
-            short = re.sub(r" \d{4}$", "", day)
-            if not body.startswith(short):
-                body = "%s: %s" % (day, body) if body else day
+    body = _answer_body(payload, question, day)
     lines = [body if _visible(body) else "(no answer)"]
     if cites:
         lines.append("")
@@ -971,6 +1014,21 @@ def display_text(payload, titles=(), lines_shown=(), question="", day=""):
     if isinstance(latency, (int, float)) and latency > LATENCY_SHOWN_ABOVE:
         lines.append("%.1f s" % latency)
     return "\n".join(_guard(line) for line in lines)
+
+
+def finalise_reply(code, obj):
+    """The one place every JSON reply gets its voice (PL1 step 4, D74 consult): on any
+    non-200 reply `spoken` is overwritten with the final `display`, never only filled in
+    when missing, so an error can never be spoken as anything else. A 200 reply with a
+    `display` and no `spoken` (the /wrong replies) speaks its display. /health carries
+    neither: no Shortcut speaks it (documented exclusion, tested)."""
+    obj = dict(obj)
+    if code != 200:
+        obj["display"] = obj.get("display") or error_display(code)
+        obj["spoken"] = obj["display"]
+    elif "display" in obj and "spoken" not in obj:
+        obj["spoken"] = obj["display"]
+    return obj
 
 
 def error_display(code):
@@ -1327,6 +1385,7 @@ class Service:
                        "citations": [], "latency_s": round(time.time() - started, 2)}
             payload["status_line"] = plain_status("unclear", "", [])
             payload["display"] = display_text(payload)
+            payload["spoken"] = spoken_text(payload)
             return 200, payload
         asked = aliases.expand(asked, self.aliases)  # P2.5 F3
         shown, titles = [], []  # display-only (B1); none on the error paths
@@ -1375,6 +1434,7 @@ class Service:
         payload["status_line"] = plain_status(payload["status"], payload["reason"],
                                               payload["citations"])
         payload["display"] = display_text(payload, titles, shown, question, label)
+        payload["spoken"] = spoken_text(payload, titles, question, label)
         if self.tracing and result is not None:
             try:
                 trace.write(result, model, self.profile, answer_id=answer_id)
@@ -1428,7 +1488,7 @@ def make_handler(service):
             except (TypeError, ValueError):
                 code = 500
             self.close_connection = True
-            body = json.dumps({"status": "error", "display": error_display(code)}).encode("utf-8")
+            body = json.dumps(finalise_reply(code, {"status": "error"})).encode("utf-8")
             self.send_response(code)  # reason phrase from http.server's fixed table
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -1471,8 +1531,7 @@ def make_handler(service):
             super().finish()
 
         def _send(self, code, obj):
-            if code != 200 and "display" not in obj:
-                obj = dict(obj, display=error_display(code))
+            obj = finalise_reply(code, obj)
             body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1593,11 +1652,17 @@ def make_handler(service):
             payload = dict(payload)
             reason_code = payload.pop(REASON_KEY, None)
             if code != 200:
-                payload = dict(payload, display=error_display(code))
+                # The error text replaces both, so the voice never says "No answer." over
+                # an actionable error (PL1 step 4 review 1/1, session 54).
+                payload = dict(payload, display=error_display(code), spoken=error_display(code))
             payload["answer_id"] = answer_id
             # Once per request, here and only here, from the outcome the phone sees: a model
             # worker that finishes after a 504 records nothing more (P2.7 steps C2, C5).
-            settle = service.remember(answer_id, question, code, payload, reason_code)
+            # The failure store gets exactly what it got before the voice existed: `spoken`
+            # is derived text for the phone, not a field the store was reviewed for (D108).
+            settle = service.remember(answer_id, question, code,
+                                      {k: v for k, v in payload.items() if k != "spoken"},
+                                      reason_code)
             try:
                 self._send(code, payload)
             finally:

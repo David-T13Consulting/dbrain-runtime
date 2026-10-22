@@ -289,6 +289,7 @@ class AcceptanceFixesTest(AskEndpointTest):
             self.assertTrue(body.get("display", "").strip(), (want, body))
             self.assertNotIn(TOKEN, body["display"])
             self.assertNotIn("unexpected", body["display"])  # no internals on the phone
+            self.assertEqual(body.get("spoken"), body["display"], want)  # PL1 step 4: voice = error text
         self.assertTrue(cases[0][0][1]["display"].startswith("Not authorised"))
 
     def test_a_client_note_pauses_the_service_with_a_display(self):
@@ -300,11 +301,24 @@ class AcceptanceFixesTest(AskEndpointTest):
             code, body = self.request("POST", "/ask", {"question": "What does tempo mean?"})
         self.assertEqual((code, body["status"]), (423, "paused"))
         self.assertTrue(body["display"].startswith("Paused"))
+        self.assertEqual(body["spoken"], body["display"])  # PL1 step 4 review 1/1
         self.assertNotIn("CLIENT_MARKER", json.dumps(body))
         self.assertIn("POLICY FLAG", err.getvalue())
         self.assertIn("client-note.md", err.getvalue())
         self.assertNotIn("CLIENT_MARKER", err.getvalue())
         self.assertEqual(self.model.calls, [])
+
+    def test_the_failure_store_never_receives_spoken(self):
+        # D74 consult (session 55): the store gets what it got before the voice existed.
+        seen = []
+        original = self.service.remember
+        def spy(answer_id, question, code, payload, reason_code):
+            seen.append(set(payload))
+            return original(answer_id, question, code, payload, reason_code)
+        self.service.remember = spy
+        self.request("POST", "/ask", {"question": "What does tempo mean?"})
+        self.assertTrue(seen)
+        self.assertNotIn("spoken", seen[0])
 
     def test_403_off_tailnet_has_a_display(self):
         self.assertIn("Tailscale", serve.error_display(403))
