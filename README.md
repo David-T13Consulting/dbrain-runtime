@@ -1,6 +1,6 @@
 # dbrain-runtime
 
-A scoped, read-only query service over the Dbrain2 vault. Built for **P2.2**.
+A scoped query service over the Dbrain2 vault, read-only except for one Inbox write (PL1 step 6). Built for **P2.2**.
 
 Separate from the vault on purpose: the vault holds knowledge, this holds code. David
 authorised this location on 2 Oct 2026. Pushed to a private GitHub `origin`; whether any
@@ -109,6 +109,14 @@ the vault, and then opened by walking that resolved path from `/` with `openat` 
 was not enough (round C): `O_NOFOLLOW` guards only the last component, so a parent swapped
 for a symlink after the check redirected the write. A test performs exactly that swap.
 Callers never `mkdir` an output directory themselves for the same reason.
+
+**The one vault write (PL1 step 6).** `dbrain/writer.py` is the only code allowed to write
+inside the vault, and it has one operation: a new file in `00 Inbox/`, for a phone capture
+David heard read back and saved (`POST /capture/save`, see `mvp/README.md`). It opens the
+vault's real path from `/` with `O_NOFOLLOW`, writes a hidden temporary file `O_EXCL`,
+places the note with `link()` (which never replaces a name), removes the temporary file,
+and checks the result. It never edits, never creates a folder, and does not use
+`outpath.py`. `/ask` still writes nothing to the vault (`tests/test_readonly.py`).
 
 The opened file must be a regular file with exactly one link, checked on the descriptor
 before anything is truncated (round D): a hard link to a vault note passes `realpath` and

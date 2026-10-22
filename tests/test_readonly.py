@@ -67,6 +67,29 @@ class ReadOnlyTest(unittest.TestCase):
         for name in dir(scope):
             self.assertNotIn(name, ("write_text", "write", "unlink", "mkdir", "rmtree"))
 
+    def test_on_a_synthetic_vault_ask_writes_nothing_and_a_capture_one_inbox_file(self):
+        """PL1 step 6: the one write the service can make is one new file in 00 Inbox/,
+        and only on save. A synthetic vault, never the real one."""
+        from datetime import datetime
+        from dbrain import serve
+        from tests.test_serve import TOKEN, whole_vault_fixture
+        root = whole_vault_fixture()
+        svc = serve.Service(TOKEN, model_factory=lambda: adapter.StubAdapter(reply="[E1] tempo"),
+                            vault=root, tracing=False)
+        svc.now = lambda: datetime(2026, 10, 22, 9, 30)
+        before = snapshot_vault(root)
+        svc.ask("What does tempo mean?")
+        status, _, fields = svc.draft_capture("Tempo pacing idea for the router talk", "work")
+        self.assertEqual(status, "draft")
+        self.assertEqual(before, snapshot_vault(root), "an answer or a draft changed the vault")
+        outcome, path = svc.save_capture(fields["id"])
+        self.assertEqual(outcome, "saved")
+        after = snapshot_vault(root)
+        added = set(after) - set(before)
+        self.assertEqual(added, {str(root / path)})
+        self.assertTrue(path.startswith("00 Inbox/"))
+        self.assertEqual({k: v for k, v in after.items() if k not in added}, before)
+
     def test_traces_default_outside_the_vault(self):
         self.assertFalse(
             str(Path(config.LOGS).resolve()).startswith(

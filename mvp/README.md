@@ -81,6 +81,21 @@ With capture off nothing is held and a tap stores nothing.
 6. Still under `Wrong`: **Get Dictionary Value** `display` from that result › **Show Result**.
 7. Leave **End Menu** where Shortcuts puts it. Nothing else changes.
 
+## Remembering from the phone (PL1 step 6)
+"Brain Remember" (`./mvp/make-voice-shortcut.sh --remember`; the lead builds it, it calls
+Brain Key for the token) asks **Work or personal?**, takes dictation, and sends
+`POST /capture {"text": ..., "domain": ...}`. The service either refuses with a spoken
+reason and keeps nothing, or freezes the exact note it would write and reads it back
+(spoken, and on screen with the file name and labels). Only **Save** sends
+`POST /capture/save {"id": ...}`, which writes that note once as a new file in `00 Inbox/`;
+Cancel, or no answer within 5 minutes, leaves nothing. Your read-back is the gate (Q154);
+the word lists in `dbrain/capture.py` refuse what they detect (secrets, long numbers,
+client or engagement words, children, health, finances, journal) and cannot see implicit
+meaning. Personal notes are refused until P1.4 is applied and the lint check passes
+(Q153, Q156). Captures never reach the model, the traces or the failure store, and the log
+records only a fixed event (`capture-draft`, `capture-refused-<class>`, `save-saved`, ...).
+Tests: `tests/test_capture.py`, `tests/test_writer.py`.
+
 ## What the service guarantees (tested in `tests/test_serve.py`)
 - Listens only on the Tailscale address (or loopback); refuses `0.0.0.0`, `::` and LAN
   addresses, and refuses any peer outside the tailnet.

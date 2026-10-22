@@ -17,8 +17,11 @@ it adds is the boundary:
     gets 504, whatever stage is still running (step 5). A late model call keeps the
     one-at-a-time lock until it returns, so it never overlaps the next question.
   * **Nothing executes:** the question is text for retrieval and the prompt; vault
-    content is evidence, never instructions; nothing is written to the vault. Traces go
+    content is evidence, never instructions; /ask writes nothing to the vault. Traces go
     to the git-ignored `artifacts/` folder through the write guard.
+  * **One write (PL1 step 6):** `POST /capture` drafts one Inbox note and reads it back;
+    `POST /capture/save` writes that exact draft once, through `writer.py`, the only code
+    that writes inside the vault (one new file in `00 Inbox/`, never an edit).
 
 `GET /health` answers without auth and without any vault content, so the Shortcut can
 tell "the Air is offline or asleep" from "the brain has no answer".
@@ -45,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import adapter as adapter_mod
-from . import aliases, answer, config, index, outpath, scope, trace
+from . import aliases, answer, capture, config, index, outpath, scope, trace, writer
 from . import failures as failures_mod
 
 # Payload key carrying the verdict's reason code from Service.ask to the capture point;
@@ -79,6 +82,31 @@ WRONG_REPLIES = {
     "off": "Marking answers wrong is switched off on this Mac.",
     "error": "Could not mark it wrong; try again.",
 }
+
+# PL1 step 6, "remember from the phone" (P3.0 Part 1). A draft is the exact bytes of one
+# Inbox note, frozen before the read-back and held in this process's memory only, for at
+# most DRAFT_TTL seconds; it is written once, on "save", and never again. Refused captures
+# leave nothing: no draft, no file, no log line with the text. Nothing here reaches the
+# model, the traces or the failure store.
+DRAFT_TTL = 300
+DRAFT_MAX = 16
+DRAFT_ID = ANSWER_ID
+MAX_DOMAIN = 16
+# /capture/save replies: fixed text, chosen by outcome only.
+SAVE_REPLIES = {
+    "unknown": "Nothing to save: that note is over 5 minutes old, or the service restarted. "
+               "Say it again.",
+    "repeat": "Already saved.",
+    "busy": "Still saving that note.",
+    "error": "Not saved: something went wrong on the Air. Say it again.",
+    "check": "Saved, but I couldn't confirm it. Check the Inbox on the Air before saying it "
+             "again.",
+    "left": "Not saved. A hidden temporary file was left in the Inbox on the Air; it needs "
+            "deleting there.",
+    "none": "Nothing was kept, so there is nothing to save.",
+}
+CAPTURE_BAD_REQUEST = "The note was empty, too long or not sent as text. Nothing was kept."
+ROUTES = ("/ask", "/health", "/wrong", "/capture", "/capture/save")
 
 
 class BindRefused(Exception):
@@ -237,6 +265,13 @@ def today_local():
     database this raises, and main() refuses to start."""
     from zoneinfo import ZoneInfo
     return datetime.now(ZoneInfo(TIMEZONE)).date()
+
+
+def now_local():
+    """The time in Brussels, naive (for an Inbox note's name and date). Same rule as
+    today_local: no fallback zone."""
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo(TIMEZONE)).replace(tzinfo=None)
 
 
 def fmt_day(d):
@@ -1185,6 +1220,82 @@ class RecentAnswers:
         return t
 
 
+class _Draft:
+    __slots__ = ("mono", "state", "text", "domain", "name", "data")
+
+    def __init__(self, mono, text, domain, name, data):
+        self.mono = mono
+        self.state = "pending"            # pending -> saving -> saved (or dropped)
+        self.text, self.domain, self.name, self.data = text, domain, name, data
+
+
+class CaptureDrafts:
+    """Drafts waiting for "save", in memory only. Each is single use: `claim` moves it to
+    `saving` under the lock, so two saves of one id never both write; after the write
+    only the outcome is kept (its text and bytes are dropped) so a repeat says "Already
+    saved" until the draft would have expired. Expired drafts are dropped on every call."""
+
+    def __init__(self, ttl=DRAFT_TTL, capacity=DRAFT_MAX, mono=time.monotonic):
+        self.ttl, self.capacity, self.mono = ttl, capacity, mono
+        self.lock = threading.Lock()
+        self.items = OrderedDict()
+
+    def __len__(self):
+        with self.lock:
+            return len(self.items)
+
+    def sweep(self):
+        with self.lock:
+            self._sweep()
+
+    def start_sweeper(self, interval=RECENT_SWEEP):
+        """Drop expired drafts even when no request comes (review 1/2 should-fix): text
+        and bytes never outlive DRAFT_TTL + interval while the Mac is awake."""
+        def run():
+            while True:
+                time.sleep(interval)
+                self.sweep()
+        t = threading.Thread(target=run, name="dbrain-drafts", daemon=True)
+        t.start()
+        return t
+
+    def _sweep(self):
+        now = self.mono()
+        for k in [k for k, d in self.items.items() if now - d.mono >= self.ttl]:
+            self.items.pop(k).data = None
+
+    def add(self, text, domain, name, data):
+        draft_id = secrets.token_hex(16)
+        with self.lock:
+            self._sweep()
+            while len(self.items) >= self.capacity:
+                self.items.popitem(last=False)[1].data = None
+            self.items[draft_id] = _Draft(self.mono(), text, domain, name, data)
+        return draft_id
+
+    def claim(self, draft_id):
+        """The draft to write, or an outcome key of SAVE_REPLIES."""
+        with self.lock:
+            self._sweep()
+            d = self.items.get(draft_id)
+            if d is None:
+                return "unknown"
+            if d.state == "saved":
+                return "repeat"
+            if d.state == "saving":
+                return "busy"
+            d.state = "saving"
+            return d
+
+    def finish(self, draft_id, d, saved):
+        with self.lock:
+            d.data = d.text = None
+            if saved and self.items.get(draft_id) is d:
+                d.state = "saved"
+            else:
+                self.items.pop(draft_id, None)
+
+
 class Service:
     """Everything the handler needs, so tests can build one with a stub model."""
 
@@ -1209,6 +1320,58 @@ class Service:
         self.recent = RecentAnswers()
         # P2.5 F3: David's words -> his notes' wording, appended before retrieval.
         self.aliases = aliases.ALIASES
+        # PL1 step 6: drafts for "remember", in memory only.
+        self.drafts = CaptureDrafts()
+        self.now = now_local
+
+    def write_vault(self):
+        """Where a saved capture goes: the live vault, never a frozen evidence corpus."""
+        return self.vault if self.vault is not None else config.VAULT
+
+    def draft_capture(self, text, domain):
+        """(status, reply fields) for POST /capture. A refusal holds nothing."""
+        reason, ok = capture.check(text, domain)
+        if reason:
+            return "refused", reason, {"display": capture.REFUSALS[reason]}
+        clean, dom = ok
+        name, data = capture.render(clean, dom, self.now())
+        draft_id = self.drafts.add(clean, dom, name, data)
+        said = capture.read_back(clean, dom)
+        shown = "%s\n\nWill be saved as %s/%s (%s, ordinary, approved external, private)." % (
+            said, writer.INBOX, name, capture.DOMAINS[dom])
+        return "draft", None, {"id": draft_id, "spoken": said, "display": shown}
+
+    def save_capture(self, draft_id):
+        """(outcome, path or None) for POST /capture/save. The draft's own bytes, checked
+        again at save time (admission and guards), written once by the one writer."""
+        d = self.drafts.claim(draft_id)
+        if isinstance(d, str):
+            return d, None
+        saved = False
+        try:
+            reason, ok = capture.check(d.text, d.domain)
+            if reason or ok != (d.text, d.domain):
+                return "error", None
+            path = writer.create_inbox_note(self.write_vault(), d.name, d.data)
+            saved = True
+            return "saved", path
+        except writer.TempLeft:
+            sys.stderr.write("%s capture save: temporary file left in the Inbox\n"
+                             % time.strftime("%Y-%m-%dT%H:%M:%S"))
+            return "left", None
+        except writer.WriteRefused:
+            return "error", None
+        except writer.NoteChanged:
+            saved = True                  # placed: a repeat must not write a second copy
+            sys.stderr.write("%s capture save: placed, not confirmed\n"
+                             % time.strftime("%Y-%m-%dT%H:%M:%S"))
+            return "check", None
+        except Exception as exc:
+            sys.stderr.write("%s capture save failed: %s\n"
+                             % (time.strftime("%Y-%m-%dT%H:%M:%S"), type(exc).__name__))
+            return "error", None
+        finally:
+            self.drafts.finish(draft_id, d, saved)
 
     def authorised(self, header):
         if not header or not header.startswith("Bearer "):
@@ -1458,7 +1621,7 @@ def make_handler(service):
             method = getattr(self, "command", None)
             method = method if method in ("GET", "POST") else "OTHER"
             path = (getattr(self, "path", "") or "").split("?", 1)[0]
-            route = path if path in ("/ask", "/health", "/wrong") else "OTHER"
+            route = path if path in ROUTES else "OTHER"
             return method, route
 
         def _log(self, event, code=None):
@@ -1580,19 +1743,22 @@ def make_handler(service):
             self._send(200, {"ok": True, "model": service.model_health(),
                              "busy": service.busy.locked()})
 
-        def _authorised_body(self, started):
-            """The checks /ask and /wrong share: token, length, body under the deadline.
-            The raw body, or None once a refusal has been sent."""
+        def _authorised_body(self, started, display=None):
+            """The checks every POST route shares: token, length, body under the deadline.
+            The raw body, or None once a refusal has been sent. `display` replaces the
+            question-worded 411/413 text on the capture routes."""
             if not service.authorised(self.headers.get("Authorization")):
                 self._send(401, {"status": "unauthorised"})
                 return None
+            extra = {"display": display} if display else {}
             try:
                 length = int(self.headers.get("Content-Length", ""))
             except ValueError:
-                self._send(411, {"status": "length required"})
+                self._send(411, dict({"status": "length required"}, **extra))
                 return None
             if length <= 0 or length > MAX_BODY:
-                self._send(413, {"status": "too large", "reason": "max %d bytes" % MAX_BODY})
+                self._send(413, dict({"status": "too large", "reason": "max %d bytes" % MAX_BODY},
+                                     **extra))
                 return None
             raw = self._read_body(length, started)
             if raw is None:  # the deadline runs from arrival, body reading included
@@ -1619,12 +1785,59 @@ def make_handler(service):
             self._log("wrong-" + outcome)
             self._send(200, {"status": outcome, "display": WRONG_REPLIES[outcome]})
 
+        def _capture(self, started):
+            """POST /capture {"text": "...", "domain": "work" | "personal"} (PL1 step 6).
+            Exactly those two keys, both text. Never calls the model, never takes the
+            question lock, never traces or captures a failure; the log gets a fixed event
+            with the refusal class only."""
+            raw = self._authorised_body(started, CAPTURE_BAD_REQUEST)
+            if raw is None:
+                return
+            try:
+                body = json.loads(raw.decode("utf-8"))
+                if not (isinstance(body, dict) and set(body) == {"text", "domain"}
+                        and isinstance(body["text"], str) and isinstance(body["domain"], str)
+                        and len(body["domain"]) <= MAX_DOMAIN):
+                    raise ValueError
+            except (ValueError, UnicodeDecodeError):
+                self._log("capture-bad-request")
+                return self._send(400, {"status": "bad request", "display": CAPTURE_BAD_REQUEST})
+            status, reason, fields = service.draft_capture(body["text"], body["domain"])
+            self._log("capture-" + (("refused-" + reason) if reason else status))
+            self._send(200, dict(fields, status=status))
+
+        def _capture_save(self, started):
+            """POST /capture/save {"id": "<draft id>"}: write that draft, once."""
+            raw = self._authorised_body(started, CAPTURE_BAD_REQUEST)
+            if raw is None:
+                return
+            try:
+                body = json.loads(raw.decode("utf-8"))
+                if not (isinstance(body, dict) and set(body) == {"id"}
+                        and isinstance(body["id"], str) and DRAFT_ID.fullmatch(body["id"])):
+                    raise ValueError
+            except (ValueError, UnicodeDecodeError):
+                # The Shortcut sends an empty id after a refusal: a plain answer, not an error.
+                self._log("save-bad-request")
+                return self._send(200, {"status": "none", "display": SAVE_REPLIES["none"]})
+            outcome, path = service.save_capture(body["id"])
+            self._log("save-" + outcome)
+            if outcome == "saved":
+                return self._send(200, {"status": "saved", "path": path,
+                                        "spoken": "Saved to your Inbox.",
+                                        "display": "Saved to your Inbox: %s" % path})
+            self._send(200, {"status": outcome, "display": SAVE_REPLIES[outcome]})
+
         def do_POST(self):
             started = self.arrived
             if not self._peer_ok():
                 return
             if self.path == "/wrong":
                 return self._wrong(started)
+            if self.path == "/capture":
+                return self._capture(started)
+            if self.path == "/capture/save":
+                return self._capture_save(started)
             if self.path != "/ask":
                 return self._send(404, {"status": "not found"})
             raw = self._authorised_body(started)
@@ -1752,6 +1965,7 @@ def main(argv=None):
     )
     del bearer
     setup_failures(service, os.environ)
+    service.drafts.start_sweeper()
     server = build_server(host, args.port, service)
     sys.stderr.write("%s dbrain-ask listening on http://%s:%d (profile %s)\n"
                      % (time.strftime("%Y-%m-%dT%H:%M:%S"), host, args.port, service.profile.name))

@@ -16,7 +16,11 @@
 #   ./mvp/make-voice-shortcut.sh --key       build, sign and open "Brain Key" (once, ever)
 #   ./mvp/make-voice-shortcut.sh --text      build, sign and open "Ask Brain Text": typed
 #                                            question, no speech, same screen (David, 21 Oct)
+#   ./mvp/make-voice-shortcut.sh --remember  build, sign and open "Brain Remember" (PL1 step 6):
+#                                            work or personal?, dictate, hear it read back,
+#                                            Save or Cancel; nothing is kept without Save
 #   ./mvp/make-voice-shortcut.sh --check     build and sign "Ask Brain" into a temp folder only
+#   ./mvp/make-voice-shortcut.sh --check-remember   the same for "Brain Remember"
 set -euo pipefail
 MODE="${1:-open}"
 
@@ -32,6 +36,7 @@ host, work, mode = os.environ["HOST"], os.environ["WORK"], os.environ["MODE"]
 PLACEHOLDER = "PASTE THE WHOLE BEARER VALUE FROM ASK BRAIN 5"
 u = lambda: str(uuid.uuid4()).upper()
 u_dict, u_ask, u_spk, u_dsp, u_id, u_wrong, u_wdsp, g_menu, u_key, u_txt = (u() for _ in range(10))
+u_list, u_dom, u_save, u_sspk, u_sdsp = (u() for _ in range(5))
 
 def text(s):
     return {"Value": {"string": s}, "WFSerializationType": "WFTextTokenString"}
@@ -110,7 +115,44 @@ actions = [
      "WFWorkflowActionParameters": {"Text": var_text(u_wdsp, "Dictionary Value")}},
     menu(2, UUID=u()),
 ]
-wf = {"WFWorkflowActions": key_actions if mode == "--key" else actions, "WFWorkflowClientVersion": "2302.0.4",
+# "Brain Remember" (PL1 step 6, P3.0 Part 1): the domain is asked first and never guessed;
+# the service reads the whole note back (spoken and on screen) and writes it only on Save.
+remember_actions = actions[:1] + [
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.list",
+     "WFWorkflowActionParameters": {"UUID": u_list, "WFItems": [
+         {"WFItemType": 0, "WFValue": text("Work")},
+         {"WFItemType": 0, "WFValue": text("Personal")}]}},
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.choosefromlist",
+     "WFWorkflowActionParameters": {"UUID": u_dom, "WFInput": var_attach(u_list, "List"),
+                                    "WFChooseFromListActionPrompt": "Work or personal?"}},
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.dictatetext",
+     "WFWorkflowActionParameters": {"UUID": u_dict, "WFDictateTextStopListening": "After Pause"}},
+    post(u_ask, "/capture", [("text", var_text(u_dict, "Dictated Text")),
+                             ("domain", var_text(u_dom, "Chosen Item"))]),
+    value(u_spk, "spoken", u_ask),
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.speaktext",
+     "WFWorkflowActionParameters": {"WFText": var_text(u_spk, "Dictionary Value"),
+                                    "WFSpeakTextWait": False}},
+    value(u_dsp, "display", u_ask),
+    value(u_id, "id", u_ask),
+    menu(0, WFMenuPrompt=var_text(u_dsp, "Dictionary Value"),
+         WFMenuItems=[{"WFItemType": 0, "WFValue": text("Save")},
+                      {"WFItemType": 0, "WFValue": text("Cancel")}]),
+    item("Save"),
+    post(u_save, "/capture/save", [("id", var_text(u_id, "Dictionary Value"))]),
+    value(u_sspk, "spoken", u_save),
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.speaktext",
+     "WFWorkflowActionParameters": {"WFText": var_text(u_sspk, "Dictionary Value"),
+                                    "WFSpeakTextWait": False}},
+    value(u_sdsp, "display", u_save),
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.showresult",
+     "WFWorkflowActionParameters": {"Text": var_text(u_sdsp, "Dictionary Value")}},
+    item("Cancel"),
+    menu(2, UUID=u()),
+]
+wf = {"WFWorkflowActions": (key_actions if mode == "--key" else
+                            remember_actions if mode in ("--remember", "--check-remember")
+                            else actions), "WFWorkflowClientVersion": "2302.0.4",
       "WFWorkflowMinimumClientVersion": 900,
       "WFWorkflowIcon": {"WFWorkflowIconStartColor": 463140863, "WFWorkflowIconGlyphNumber": 59446},
       "WFWorkflowImportQuestions": [], "WFWorkflowTypes": [], "WFWorkflowInputContentItemClasses": [],
@@ -122,12 +164,13 @@ PY
 case "$MODE" in
   --key) NAME="Brain Key" ;;
   --text) NAME="Ask Brain Text" ;;
+  --remember|--check-remember) NAME="Brain Remember" ;;
   *) NAME="Ask Brain" ;;
 esac
 OUT="$WORK/$NAME.shortcut"
 shortcuts sign --mode anyone --input "$WORK/unsigned.shortcut" --output "$OUT"
 echo "Built for http://$HOST:8765 (no token inside)."
-if [ "$MODE" = "--check" ]; then
+if [ "$MODE" = "--check" ] || [ "$MODE" = "--check-remember" ]; then
   echo "Check only: signed OK, not opened."
   exit 0
 fi
