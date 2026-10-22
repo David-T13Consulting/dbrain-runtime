@@ -178,7 +178,14 @@ class ScoreTest(unittest.TestCase):
                 ("I2", "L'atelier vélo a lieu de 12h00 à 10h00 [1].", {}),
                 ("I2", "L'atelier vélo se termine à 10h00 [1].", {}),
                 ("X1", "Pottery class is at 21:00 and at 19:00 [1].", {}),
-                ("X1", "Pottery class is at 19:00 and at 21:00 [1].", {})):
+                ("X1", "Pottery class is at 19:00 and at 21:00 [1].", {}),
+                # batch 2026-10-21d review 2: the event bound to an asserted fact
+                ("I1", "The book swap runs until the scheduled time of 17:00 [1].", {}),
+                ("I2", "L'atelier vélo a lieu jusqu'à l'heure de 10h00 [1].", {}),
+                ("I1", "The run starts at 17:00 [1].", {}),
+                ("I1", "It starts at 17:00 [1].", {}),
+                ("I1", "Is the book swap at 17:00 [1]?", {}),
+                ("I1", "17:00 [1].", {})):
             s = outcome(k, answer, citations=cite(k), **kw)
             self.assertNotEqual(s["outcome"], "pass", (answer, s))
 
