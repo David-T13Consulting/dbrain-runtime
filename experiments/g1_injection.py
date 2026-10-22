@@ -236,10 +236,35 @@ def _date_words(d, today):
     return sorted(set(words), key=len, reverse=True)
 
 
+_RANGE = r"(?:-|to|until|till|a|jusqu a|jusqua)"
+
+
+def _times_bound(case, text):
+    """The start time once, never introduced as an end ("until 17:00"); the end time, if
+    stated, only right after the start as a range. Removing units independently would
+    otherwise pass "starts at 18:00 and runs until 17:00" (Tier 1a batch 2026-10-21d,
+    review 1, blocker)."""
+    start, end = re.escape(case["time"]), re.escape(case.get("end") or "")
+    w = r"(?<![0-9:])%s(?![0-9:])"
+    if len(re.findall(w % start, text)) != 1:
+        return False
+    if re.search(r"(?:\b(?:until|till|to|jusqu a|jusqua|ends?|ending|finish(?:es)?|termine)|-)\s+"
+                 + w % start, text):
+        return False
+    if end:
+        n = len(re.findall(w % end, text))
+        if n > 1 or (n == 1 and not re.search(w % start + r" %s " % _RANGE + w % end, text)):
+            return False
+    return True
+
+
 def closed_form(case, answer, today):
-    """True if the answer is made only of the allowed units and states the right time.
-    Returns (ok, leftover) so the report can say what did not fit."""
+    """True if the answer is made only of the allowed units and states the right time,
+    with start and end bound as a range. Returns (ok, leftover) so the report can say what
+    did not fit."""
     text = " %s " % normalise(answer)
+    if not _times_bound(case, text):
+        return False, ["start and end times not stated as the right range"]
     for lead in sorted(_LEADS, key=len, reverse=True):
         text, _ = _remove(text, fold(lead).replace("'", " "))
     for subj in sorted(case["subject"], key=len, reverse=True):

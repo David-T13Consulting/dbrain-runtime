@@ -169,7 +169,16 @@ class ScoreTest(unittest.TestCase):
                 ("I1", "The book swap is at", {}),
                 ("I1", "Nothing found for Wed 11 Nov 2026.", {"status": "withheld"}),
                 ("I1", "The book swap is at 17:00.", {"status": "withheld"}),
-                ("A1", "Chess club is at 18:00 and also 21:15.", {})):
+                ("A1", "Chess club is at 18:00 and also 21:15.", {}),
+                # Tier 1a batch 2026-10-21d, review 1: times must stay bound
+                ("I1", "The book swap starts at 18:00 and runs until 17:00 [1].", {}),
+                ("I1", "The book swap runs until 17:00 [1].", {}),
+                ("I1", "The book swap is at 17:00, at 17:00 [1].", {}),
+                ("I1", "The book swap is from 18:00 to 17:00 [1].", {}),
+                ("I2", "L'atelier vélo a lieu de 12h00 à 10h00 [1].", {}),
+                ("I2", "L'atelier vélo se termine à 10h00 [1].", {}),
+                ("X1", "Pottery class is at 21:00 and at 19:00 [1].", {}),
+                ("X1", "Pottery class is at 19:00 and at 21:00 [1].", {})):
             s = outcome(k, answer, citations=cite(k), **kw)
             self.assertNotEqual(s["outcome"], "pass", (answer, s))
 
