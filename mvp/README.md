@@ -96,6 +96,22 @@ meaning. Personal notes are refused until P1.4 is applied and the lint check pas
 records only a fixed event (`capture-draft`, `capture-refused-<class>`, `save-saved`, ...).
 Tests: `tests/test_capture.py`, `tests/test_writer.py`.
 
+## Correcting from the phone (PL1 step 7, append-only, D143)
+After an answer, "Ask Brain" (and "Ask Brain Text") offer **OK / Wrong / Correct**.
+**Correct** asks which source number (1 by default), **Work or personal?**, and what is
+correct, then sends `POST /correct {"answer_id", "source", "text", "domain"}`. The phone
+never sends a path: the service kept each recent answer's cited notes (paths and hashes
+only, in memory, for the "wrong" hour). The model rewords the correction once (skipped
+when busy or slow; anything the word lists refuse falls back to your own words), and the
+service reads back the note it would add **and the note that will leave answers**. **Save**
+goes through `POST /capture/save`: the one writer adds one new Inbox note with
+`note_type: correction` and `corrects: <path>`; from the next question the index leaves the
+named note out of answers. No existing file is edited, so undoing a correction is deleting
+that Inbox note. Refused, and nothing kept: an answer over an hour old, a source number it
+did not have, a note that changed since the answer or is not served, a path whose words or
+shape the guards refuse, and everything step 6 refuses. The whole named note leaves answers,
+not just the wrong line (accepted in D143). Tests: `tests/test_correct.py`.
+
 ## What the service guarantees (tested in `tests/test_serve.py`)
 - Listens only on the Tailscale address (or loopback); refuses `0.0.0.0`, `::` and LAN
   addresses, and refuses any peer outside the tailnet.
@@ -105,7 +121,8 @@ Tests: `tests/test_capture.py`, `tests/test_writer.py`.
 - No cloud fallback: if the local model is down the answer is 503 "unavailable".
 - Status is `incomplete`, `withheld`, `unclear` (a date it could not read: no answer, asks again), `malformed` or `unavailable`; never `supported`
   before T4.1 (Q21). Citations show their folder; `00 Inbox` ones are marked unreviewed.
-- Nothing in the vault changes.
+- `/ask` changes nothing in the vault; only a Save after a read-back adds one new Inbox
+  note (steps 6 and 7).
 
 ## Traffic and data flow (for T8)
 Content travels only between David's devices, encrypted by WireGuard. Tailscale's

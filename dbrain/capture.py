@@ -1,7 +1,8 @@
 """PL1 step 6 (P3.0 Part 1): "remember from the phone", the drafting side. Pure functions,
 no I/O: `check` turns what David dictated, and his "work or personal?" answer, into either
 a refusal or a draft; `render` turns a draft into the exact bytes of one new Inbox note.
-The writer (`writer.py`) is the only code that puts those bytes in the vault.
+The writer (`writer.py`) is the only code that puts those bytes in the vault. Step 7's
+corrections (D143) are the same kind of note, rendered by `render_correction`.
 
 **The gate is David's read-back and "save" (Q154 (a), David 22 Oct).** The service speaks
 the draft back and writes it only when he says "save". The word lists below are a second
@@ -307,3 +308,88 @@ def read_back(text, domain):
     did not choose himself is fixed, so this names the label and repeats the words."""
     label = "Work" if domain_of(domain) == "work" else "Personal"
     return "%s note for your Inbox: %s. Say Save to keep it." % (label, clean(text))
+
+
+# PL1 step 7, append-only correction (D143). A correction is one more Inbox note, written by
+# the same writer under the same gate, that names the note it corrects in `corrects:`; the
+# index then leaves the named note out of answers (`index.build`). No existing file is ever
+# edited. The whole named note leaves answers, not just the wrong line: accepted in D143.
+CORRECTION_TYPE = "correction"
+# The target goes into the frontmatter as a bare value, so it must be a path that both the
+# index grammar and YAML read back exactly: word characters, spaces and a few marks, no
+# colon, `#`, quote, bracket, pipe or backslash; each segment starts with a letter or digit.
+TARGET = re.compile(r"[^\W_][\w .,()-]*(?:/[^\W_][\w .,()-]*)*\.md")
+MAX_TARGET = 200
+_DATE_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{4}-")
+
+CORRECT_REFUSALS = {
+    "unknown": "Too late to correct that answer: it is over an hour old, or the service "
+               "restarted. Ask again, then correct it. Nothing was kept.",
+    "source": "That answer has no source with that number. Nothing was kept.",
+    "target": "That note can't be corrected from the phone; change it in Obsidian. "
+              "Nothing was kept.",
+    "changed": "That note changed after the answer. Ask again, then correct it. Nothing was "
+               "kept.",
+}
+
+
+def check_target(path):
+    """None if `path` may be named by a correction, else a refusal key. The path is saved
+    too, so it goes through the same word lists and, segment by segment, the same number
+    and key shapes as the text; only a leading Inbox date stamp (`YYYY-MM-DD-HHMM-`) is
+    exempt, since it would always look like an ID number (review 1/2, session 59)."""
+    if not isinstance(path, str) or len(path) > MAX_TARGET or not TARGET.fullmatch(path):
+        return "target"
+    if path != unicodedata.normalize("NFC", path) or clean(path) != path:
+        return "target"
+    for segment in path[:-3].split("/"):
+        rest = _DATE_STAMP.sub("", segment, count=1)
+        if _looks_id_number(rest, fold(rest).split()):
+            return "id_number"
+        if _looks_secret(rest):
+            return "secret"
+    words = " " + fold(path[:-3]) + " "
+    for phrase in ALLOWED_PHRASES:
+        words = words.replace(" %s " % phrase, " ")
+    return _term_class(words.split())
+
+
+def render_correction(text, domain, target, now):
+    """(file name, exact bytes) of the Inbox note for an admitted correction of `target`.
+    Same labels as a capture, `note_type: correction`, and `corrects: <target>`."""
+    t, d = clean(text), domain_of(domain)
+    if not t or d is None or check_target(target) is not None:
+        raise ValueError("render_correction needs an admitted correction and target")
+    name = "%s-correction-%s.md" % (now.strftime("%Y-%m-%d-%H%M"), slug(t, words=5))
+    lines = ["---"]
+    for key, value in LABELS:
+        if key == "domain":
+            value = DOMAINS[d]
+        elif key == "note_type":
+            value = CORRECTION_TYPE
+        lines.append("%s: %s" % (key, value))
+    lines += ["corrects: %s" % target,
+              "created: %s" % now.strftime("%Y-%m-%d"),
+              "updated: %s" % now.strftime("%Y-%m-%d"),
+              "---",
+              "# Correction from the phone, %s %d %s %d, %s" % (_DAYS[now.weekday()], now.day,
+                                                               _MONTHS[now.month - 1], now.year,
+                                                               now.strftime("%H:%M")),
+              "",
+              t,
+              "",
+              "Replaces in answers the note %s." % target,
+              ""]
+    return name, "\n".join(lines).encode("utf-8")
+
+
+def target_title(target):
+    """The corrected note as the phone names it: its file name without folder or `.md`."""
+    return target.rsplit("/", 1)[-1][:-3]
+
+
+def read_back_correction(text, domain, target):
+    label = "Work" if domain_of(domain) == "work" else "Personal"
+    return ("%s correction for your Inbox: %s. The note %s will no longer be used in "
+            "answers. Say Save to keep it." % (label, clean(text).rstrip("."),
+                                                target_title(target)))

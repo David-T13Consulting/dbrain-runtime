@@ -22,6 +22,9 @@ it adds is the boundary:
   * **One write (PL1 step 6):** `POST /capture` drafts one Inbox note and reads it back;
     `POST /capture/save` writes that exact draft once, through `writer.py`, the only code
     that writes inside the vault (one new file in `00 Inbox/`, never an edit).
+  * **Corrections (PL1 step 7, D143) are append-only:** `POST /correct` drafts one more
+    Inbox note naming a note the answer cited; saved through `/capture/save`, it makes the
+    index leave the named note out of answers. No existing file is edited.
 
 `GET /health` answers without auth and without any vault content, so the Shortcut can
 tell "the Air is offline or asleep" from "the brain has no answer".
@@ -104,9 +107,24 @@ SAVE_REPLIES = {
     "left": "Not saved. A hidden temporary file was left in the Inbox on the Air; it needs "
             "deleting there.",
     "none": "Nothing was kept, so there is nothing to save.",
+    "changed": "Not saved: the note it corrects changed in the meantime. Ask again, then "
+               "correct it.",
 }
 CAPTURE_BAD_REQUEST = "The note was empty, too long or not sent as text. Nothing was kept."
-ROUTES = ("/ask", "/health", "/wrong", "/capture", "/capture/save")
+# PL1 step 7 (D143): the notes each recent answer cited, as (path, SHA-256) pairs, so the
+# phone names a correction's target by answer id and source number, never by a path. Paths
+# and hashes only, in memory, for as long as a "wrong" tap is accepted.
+CORRECT_SOURCE = re.compile(r"[1-9]")
+# The model rewords the dictated correction once (D143); a slow or busy model is skipped and
+# David's own words are used. Either way he hears the exact text before "save".
+CORRECT_MODEL_TIMEOUT = 20
+CORRECT_MAX_TOKENS = 120
+CORRECT_PROMPT = (
+    "David says an answer from his notes was wrong and dictated this correction:\n\n"
+    "{text}\n\n"
+    "Rewrite it as one short standalone statement of the correct fact, in the same language. "
+    "Use only what he said; add nothing. Reply with the statement only.")
+ROUTES = ("/ask", "/health", "/wrong", "/capture", "/capture/save", "/correct")
 
 
 class BindRefused(Exception):
@@ -1220,13 +1238,56 @@ class RecentAnswers:
         return t
 
 
-class _Draft:
-    __slots__ = ("mono", "state", "text", "domain", "name", "data")
+class CitedNotes:
+    """answer id -> the (path, SHA-256) of each note it cited, in the phone's order (PL1
+    step 7). Bounded in number and age like RecentAnswers; no note text is held."""
 
-    def __init__(self, mono, text, domain, name, data):
+    def __init__(self, capacity=RECENT_MAX, window=RECENT_WINDOW, mono=time.monotonic):
+        self.capacity, self.window, self.mono = capacity, window, mono
+        self.lock = threading.Lock()
+        self.items = OrderedDict()
+
+    def put(self, answer_id, cited):
+        with self.lock:
+            self.items[answer_id] = (self.mono(), tuple(cited))
+            while len(self.items) > self.capacity:
+                self.items.popitem(last=False)
+
+    def _sweep(self):
+        now = self.mono()
+        for k in [k for k, (t, _) in self.items.items() if now - t >= self.window]:
+            del self.items[k]
+
+    def sweep(self):
+        with self.lock:
+            self._sweep()
+
+    def get(self, answer_id):
+        with self.lock:
+            self._sweep()
+            hit = self.items.get(answer_id)
+            return hit[1] if hit else None
+
+    def start_sweeper(self, interval=RECENT_SWEEP):
+        """Drop expired entries even when no correction comes (review 2/2 should-fix,
+        session 59): paths and hashes never outlive the "wrong" hour while the Mac is awake."""
+        def run():
+            while True:
+                time.sleep(interval)
+                self.sweep()
+        t = threading.Thread(target=run, name="dbrain-cited", daemon=True)
+        t.start()
+        return t
+
+
+class _Draft:
+    __slots__ = ("mono", "state", "text", "domain", "name", "data", "target")
+
+    def __init__(self, mono, text, domain, name, data, target=None):
         self.mono = mono
         self.state = "pending"            # pending -> saving -> saved (or dropped)
         self.text, self.domain, self.name, self.data = text, domain, name, data
+        self.target = target              # step 7: (path, SHA-256) it corrects, else None
 
 
 class CaptureDrafts:
@@ -1264,13 +1325,13 @@ class CaptureDrafts:
         for k in [k for k, d in self.items.items() if now - d.mono >= self.ttl]:
             self.items.pop(k).data = None
 
-    def add(self, text, domain, name, data):
+    def add(self, text, domain, name, data, target=None):
         draft_id = secrets.token_hex(16)
         with self.lock:
             self._sweep()
             while len(self.items) >= self.capacity:
                 self.items.popitem(last=False)[1].data = None
-            self.items[draft_id] = _Draft(self.mono(), text, domain, name, data)
+            self.items[draft_id] = _Draft(self.mono(), text, domain, name, data, target)
         return draft_id
 
     def claim(self, draft_id):
@@ -1322,6 +1383,8 @@ class Service:
         self.aliases = aliases.ALIASES
         # PL1 step 6: drafts for "remember", in memory only.
         self.drafts = CaptureDrafts()
+        # PL1 step 7: which notes each recent answer cited, for "that's wrong".
+        self.cited = CitedNotes()
         self.now = now_local
 
     def write_vault(self):
@@ -1341,9 +1404,76 @@ class Service:
             said, writer.INBOX, name, capture.DOMAINS[dom])
         return "draft", None, {"id": draft_id, "spoken": said, "display": shown}
 
+    def _served(self, path, sha):
+        """True if the index the phone's answers use serves `path` with exactly these bytes
+        (in scope, label-checked, not already corrected, unchanged since the answer)."""
+        try:
+            _, files = index.build(self.profile, self.vault, skipped=[])
+        except scope.ScopeError:          # ProhibitedNote included: no correction then
+            return False
+        return bool(sha) and hmac.compare_digest(files.get(path) or "", sha)
+
+    def _reword(self, words, domain):
+        """The model's one-sentence version of the dictated correction, or `words` when the
+        model is busy, slow, failing, or its text fails the same guards (D143)."""
+        if not self.busy.acquire(blocking=False):
+            return words
+        box = {}
+
+        def work():
+            try:
+                text, _ = self.model_factory().generate(
+                    CORRECT_PROMPT.format(text=words), max_tokens=CORRECT_MAX_TOKENS)
+                box["text"] = text
+            except Exception:
+                pass
+            finally:
+                self.busy.release()       # only when the model call really ends
+
+        worker = threading.Thread(target=work, name="dbrain-correct", daemon=True)
+        worker.start()
+        worker.join(CORRECT_MODEL_TIMEOUT)
+        got = None if worker.is_alive() else box.get("text")
+        if not isinstance(got, str):
+            return words
+        reason, ok = capture.check(got.strip().strip('"“”'), domain)
+        return words if reason else ok[0]
+
+    def draft_correction(self, answer_id, source, text, domain):
+        """(status, reason, reply fields) for POST /correct. The target is the answer's
+        `source`-th cited note, as the phone listed it; a refusal holds nothing."""
+        def refuse(reason):
+            msg = capture.REFUSALS.get(reason) or capture.CORRECT_REFUSALS[reason]
+            return "refused", reason, {"display": msg, "spoken": msg}
+        cited = self.cited.get(answer_id)
+        if cited is None:
+            return refuse("unknown")
+        if not 1 <= source <= len(cited):
+            return refuse("source")
+        target, sha = cited[source - 1]
+        reason, ok = capture.check(text, domain)
+        if reason:
+            return refuse(reason)
+        reason = capture.check_target(target)
+        if reason:
+            return refuse(reason)
+        if not self._served(target, sha):
+            return refuse("changed")
+        words, dom = ok
+        statement = self._reword(words, dom)
+        name, data = capture.render_correction(statement, dom, target, self.now())
+        if index.correction_target(data.decode("utf-8")) != target:
+            return refuse("target")       # the index would not read the target back exactly
+        draft_id = self.drafts.add(statement, dom, name, data, target=(target, sha))
+        said = capture.read_back_correction(statement, dom, target)
+        shown = "%s\n\nWill be saved as %s/%s (%s, ordinary, approved external, private), " \
+                "naming %s." % (said, writer.INBOX, name, capture.DOMAINS[dom], target)
+        return "draft", None, {"id": draft_id, "spoken": said, "display": shown}
+
     def save_capture(self, draft_id):
         """(outcome, path or None) for POST /capture/save. The draft's own bytes, checked
-        again at save time (admission and guards), written once by the one writer."""
+        again at save time (admission and guards), written once by the one writer. A
+        correction's target must still be served with the bytes the answer cited."""
         d = self.drafts.claim(draft_id)
         if isinstance(d, str):
             return d, None
@@ -1352,6 +1482,15 @@ class Service:
             reason, ok = capture.check(d.text, d.domain)
             if reason or ok != (d.text, d.domain):
                 return "error", None
+            if d.target is not None:
+                target, sha = d.target
+                if (capture.check_target(target) is not None
+                        or index.correction_target(d.data.decode("utf-8")) != target):
+                    return "error", None
+                if not self._served(target, sha):
+                    return "changed", None
+            elif index.correction_target(d.data.decode("utf-8")) is not None:
+                return "error", None      # a plain capture never names a note to hide
             path = writer.create_inbox_note(self.write_vault(), d.name, d.data)
             saved = True
             return "saved", path
@@ -1560,6 +1699,9 @@ class Service:
             check_dated_negation(result, [d for _, ds in found for d in ds])
             cites, shown = self._citations(result)  # renumbers result.answer: first
             titles = self.titles(cites, result.files)
+            if answer_id is not None:     # PL1 step 7: paths and hashes only
+                self.cited.put(answer_id, [(c["path"], result.files.get(c["path"]))
+                                           for c in cites])
             if found and result.answer:
                 # Always state the date the question was resolved to, whatever the answer
                 # says (Codex consultation, session 20): it sets the context next to the
@@ -1806,6 +1948,34 @@ def make_handler(service):
             self._log("capture-" + (("refused-" + reason) if reason else status))
             self._send(200, dict(fields, status=status))
 
+        def _correct(self, started):
+            """POST /correct {"answer_id": "...", "source": "1".."9", "text": "...",
+            "domain": "work" | "personal"} (PL1 step 7, D143). Exactly those keys. Drafts one
+            correction note and reads it back; the save goes through /capture/save. The log
+            gets a fixed event with the refusal class only."""
+            raw = self._authorised_body(started, CAPTURE_BAD_REQUEST)
+            if raw is None:
+                return
+            try:
+                body = json.loads(raw.decode("utf-8"))
+                if not (isinstance(body, dict)
+                        and set(body) == {"answer_id", "source", "text", "domain"}
+                        and isinstance(body["answer_id"], str)
+                        and ANSWER_ID.fullmatch(body["answer_id"])
+                        and isinstance(body["source"], (str, int))
+                        and not isinstance(body["source"], bool)
+                        and CORRECT_SOURCE.fullmatch(str(body["source"]).strip())
+                        and isinstance(body["text"], str) and isinstance(body["domain"], str)
+                        and len(body["domain"]) <= MAX_DOMAIN):
+                    raise ValueError
+            except (ValueError, UnicodeDecodeError):
+                self._log("correct-bad-request")
+                return self._send(400, {"status": "bad request", "display": CAPTURE_BAD_REQUEST})
+            status, reason, fields = service.draft_correction(
+                body["answer_id"], int(str(body["source"]).strip()), body["text"], body["domain"])
+            self._log("correct-" + (("refused-" + reason) if reason else status))
+            self._send(200, dict(fields, status=status))
+
         def _capture_save(self, started):
             """POST /capture/save {"id": "<draft id>"}: write that draft, once."""
             raw = self._authorised_body(started, CAPTURE_BAD_REQUEST)
@@ -1838,6 +2008,8 @@ def make_handler(service):
                 return self._capture(started)
             if self.path == "/capture/save":
                 return self._capture_save(started)
+            if self.path == "/correct":
+                return self._correct(started)
             if self.path != "/ask":
                 return self._send(404, {"status": "not found"})
             raw = self._authorised_body(started)
@@ -1966,6 +2138,7 @@ def main(argv=None):
     del bearer
     setup_failures(service, os.environ)
     service.drafts.start_sweeper()
+    service.cited.start_sweeper()
     server = build_server(host, args.port, service)
     sys.stderr.write("%s dbrain-ask listening on http://%s:%d (profile %s)\n"
                      % (time.strftime("%Y-%m-%dT%H:%M:%S"), host, args.port, service.profile.name))

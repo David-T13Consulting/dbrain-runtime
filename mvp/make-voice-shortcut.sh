@@ -19,6 +19,8 @@
 #   ./mvp/make-voice-shortcut.sh --remember  build, sign and open "Brain Remember" (PL1 step 6):
 #                                            work or personal?, dictate, hear it read back,
 #                                            Save or Cancel; nothing is kept without Save
+#                                            "Ask Brain" and "Ask Brain Text" answers offer OK,
+#                                            Wrong and Correct (PL1 step 7: append-only, D143)
 #   ./mvp/make-voice-shortcut.sh --check     build and sign "Ask Brain" into a temp folder only
 #   ./mvp/make-voice-shortcut.sh --check-remember   the same for "Brain Remember"
 set -euo pipefail
@@ -37,6 +39,8 @@ PLACEHOLDER = "PASTE THE WHOLE BEARER VALUE FROM ASK BRAIN 5"
 u = lambda: str(uuid.uuid4()).upper()
 u_dict, u_ask, u_spk, u_dsp, u_id, u_wrong, u_wdsp, g_menu, u_key, u_txt = (u() for _ in range(10))
 u_list, u_dom, u_save, u_sspk, u_sdsp = (u() for _ in range(5))
+u_src, u_clist, u_cdom, u_cdict, u_cor, u_cspk, u_cdsp, u_cid, g_cmenu = (u() for _ in range(9))
+u_csave, u_csdsp = (u() for _ in range(2))
 
 def text(s):
     return {"Value": {"string": s}, "WFSerializationType": "WFTextTokenString"}
@@ -63,13 +67,13 @@ def value(uid, key, src):
             "WFWorkflowActionParameters": {"UUID": uid, "WFGetDictionaryValueType": "Value",
                                            "WFDictionaryKey": key,
                                            "WFInput": var_attach(src, "Contents of URL")}}
-def menu(mode, **extra):
-    p = {"GroupingIdentifier": g_menu, "WFControlFlowMode": mode}
+def menu(mode, group=None, **extra):
+    p = {"GroupingIdentifier": group or g_menu, "WFControlFlowMode": mode}
     p.update(extra)
     return {"WFWorkflowActionIdentifier": "is.workflow.actions.choosefrommenu",
             "WFWorkflowActionParameters": p}
-def item(title):
-    return menu(1, WFMenuItemTitle=title, WFMenuItemAttributedTitle=text(title))
+def item(title, group=None):
+    return menu(1, group, WFMenuItemTitle=title, WFMenuItemAttributedTitle=text(title))
 
 KEY_NAME = "Brain Key"
 key_actions = [
@@ -77,6 +81,50 @@ key_actions = [
      "WFWorkflowActionParameters": {"UUID": u_txt, "WFTextActionText": text(PLACEHOLDER)}},
     {"WFWorkflowActionIdentifier": "is.workflow.actions.output",
      "WFWorkflowActionParameters": {"WFOutput": var_text(u_txt, "Text")}},
+]
+# "Correct" (PL1 step 7, D143, append-only): which source, work or personal, the correction;
+# the service reads back the note it will add and the note that leaves answers; Save writes
+# one new Inbox note through /capture/save, Cancel keeps nothing.
+typed = mode == "--text"
+correct_actions = [
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.ask",
+     "WFWorkflowActionParameters": {"UUID": u_src, "WFAskActionPrompt": "Which source number?",
+                                    "WFInputType": "Number", "WFAskActionDefaultAnswer": "1"}},
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.list",
+     "WFWorkflowActionParameters": {"UUID": u_clist, "WFItems": [
+         {"WFItemType": 0, "WFValue": text("Work")},
+         {"WFItemType": 0, "WFValue": text("Personal")}]}},
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.choosefromlist",
+     "WFWorkflowActionParameters": {"UUID": u_cdom, "WFInput": var_attach(u_clist, "List"),
+                                    "WFChooseFromListActionPrompt": "Work or personal?"}},
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.ask",
+     "WFWorkflowActionParameters": {"UUID": u_cdict, "WFAskActionPrompt": "What is correct?",
+                                    "WFInputType": "Text"}} if typed else
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.dictatetext",
+     "WFWorkflowActionParameters": {"UUID": u_cdict, "WFDictateTextStopListening": "After Pause"}},
+    post(u_cor, "/correct", [("answer_id", var_text(u_id, "Dictionary Value")),
+                             ("source", var_text(u_src, "Provided Input")),
+                             ("text", var_text(u_cdict, "Provided Input" if typed
+                                               else "Dictated Text")),
+                             ("domain", var_text(u_cdom, "Chosen Item"))]),
+] + ([] if typed else [
+    value(u_cspk, "spoken", u_cor),
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.speaktext",
+     "WFWorkflowActionParameters": {"WFText": var_text(u_cspk, "Dictionary Value"),
+                                    "WFSpeakTextWait": False}},
+]) + [
+    value(u_cdsp, "display", u_cor),
+    value(u_cid, "id", u_cor),
+    menu(0, g_cmenu, WFMenuPrompt=var_text(u_cdsp, "Dictionary Value"),
+         WFMenuItems=[{"WFItemType": 0, "WFValue": text("Save")},
+                      {"WFItemType": 0, "WFValue": text("Cancel")}]),
+    item("Save", g_cmenu),
+    post(u_csave, "/capture/save", [("id", var_text(u_cid, "Dictionary Value"))]),
+    value(u_csdsp, "display", u_csave),
+    {"WFWorkflowActionIdentifier": "is.workflow.actions.showresult",
+     "WFWorkflowActionParameters": {"Text": var_text(u_csdsp, "Dictionary Value")}},
+    item("Cancel", g_cmenu),
+    menu(2, g_cmenu, UUID=u()),
 ]
 actions = [
     {"WFWorkflowActionIdentifier": "is.workflow.actions.runworkflow",
@@ -106,13 +154,16 @@ actions = [
     # (the plain-string form showed no menu on the phone).
     menu(0, WFMenuPrompt=var_text(u_dsp, "Dictionary Value"),
          WFMenuItems=[{"WFItemType": 0, "WFValue": text("OK")},
-                      {"WFItemType": 0, "WFValue": text("Wrong")}]),
+                      {"WFItemType": 0, "WFValue": text("Wrong")},
+                      {"WFItemType": 0, "WFValue": text("Correct")}]),
     item("OK"),
     item("Wrong"),
     post(u_wrong, "/wrong", [("id", var_text(u_id, "Dictionary Value"))]),
     value(u_wdsp, "display", u_wrong),
     {"WFWorkflowActionIdentifier": "is.workflow.actions.showresult",
      "WFWorkflowActionParameters": {"Text": var_text(u_wdsp, "Dictionary Value")}},
+    item("Correct"),
+] + correct_actions + [
     menu(2, UUID=u()),
 ]
 # "Brain Remember" (PL1 step 6, P3.0 Part 1): the domain is asked first and never guessed;

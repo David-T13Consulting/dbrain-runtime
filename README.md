@@ -1,6 +1,6 @@
 # dbrain-runtime
 
-A scoped query service over the Dbrain2 vault, read-only except for one Inbox write (PL1 step 6). Built for **P2.2**.
+A scoped query service over the Dbrain2 vault, read-only except for one Inbox write (PL1 steps 6-7). Built for **P2.2**.
 
 Separate from the vault on purpose: the vault holds knowledge, this holds code. David
 authorised this location on 2 Oct 2026. Pushed to a private GitHub `origin`; whether any
@@ -117,6 +117,9 @@ vault's real path from `/` with `O_NOFOLLOW`, writes a hidden temporary file `O_
 places the note with `link()` (which never replaces a name), removes the temporary file,
 and checks the result. It never edits, never creates a folder, and does not use
 `outpath.py`. `/ask` still writes nothing to the vault (`tests/test_readonly.py`).
+A correction from the phone (PL1 step 7, D143) is the same operation: one more Inbox note
+naming the corrected note in `corrects:`; `index.build` then leaves that note out. Nothing
+is ever edited (`tests/test_correct.py`).
 
 The opened file must be a regular file with exactly one link, checked on the descriptor
 before anything is truncated (round D): a hard link to a vault note passes `realpath` and

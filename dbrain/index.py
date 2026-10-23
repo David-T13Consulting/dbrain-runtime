@@ -141,6 +141,8 @@ def build(profile, vault=None, skipped=None):
         vault = getattr(profile, "vault", None)  # a frozen corpus (config.DEVCASE_CORPUS)
     chunks = []
     files = {}
+    notes = []
+    corrected = set()
     for parts in scope.iter_allowed_files(profile, vault):
         rel = scope.as_posix(parts)
         raw = scope.read_text(rel, profile, vault)
@@ -153,6 +155,16 @@ def build(profile, vault=None, skipped=None):
                 raise
             if skipped is not None:
                 skipped.append((rel, str(exc)))
+            continue
+        notes.append((rel, raw))
+        target = correction_target(raw) if rel.startswith(INBOX_PREFIX) else None
+        if target is not None:
+            corrected.add(target)
+    # PL1 step 7 (D143): a note named by a correction leaves answers, whatever the order the
+    # files were read in. Every note was label-checked above, so a correction can never hide
+    # a prohibited note: that one has already stopped the build.
+    for rel, raw in notes:
+        if rel in corrected:
             continue
         files[rel] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -437,6 +449,29 @@ def _checked_label(raw):
             raise UnverifiableNote("the YAML parser reads classification %r, the grammar %r"
                                  % (parsed.get("classification"), label))
     return label
+
+
+INBOX_PREFIX = "00 Inbox/"
+
+
+def correction_target(raw):
+    """The path a correction note names (PL1 step 7, D143), or None. Only a note whose
+    frontmatter passes the grammar, with the plain values `note_type: correction` and
+    `corrects: <path>`, names one; `build` asks only of notes in `00 Inbox/` that passed
+    the label check. Never raises."""
+    try:
+        fm, terminated = _fence_split(raw)
+        if fm is None or not terminated:
+            return None
+        entries = _entries(fm)
+    except scope.ScopeError:
+        return None
+    note_type, corrects = entries.get("note_type"), entries.get("corrects")
+    if not (note_type and corrects and note_type[0] == "plain" and corrects[0] == "plain"):
+        return None
+    if note_type[1] != "correction" or not corrects[1]:
+        return None
+    return corrects[1]
 
 
 def _check_label(raw, rel):
