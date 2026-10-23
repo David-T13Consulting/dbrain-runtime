@@ -265,6 +265,21 @@ class ReportWriteTest(unittest.TestCase):
             self.assertNotIn("abc", str(cm.exception))
         self.assertEqual(g.endpoint_port("http://127.0.0.1:18089"), 18089)
 
+    def test_a_bad_port_never_echoes_the_endpoint(self):
+        # Review 2/2 should-fix (a), Q166: urlsplit's ValueError path printed the URL.
+        for ep in ("http://user:secret@127.0.0.1:99999", "http://127.0.0.1:bad?key=abc"):
+            with self.assertRaises(SystemExit) as cm:
+                g.endpoint_port(ep)
+            self.assertNotIn("secret", str(cm.exception))
+            self.assertNotIn("abc", str(cm.exception))
+
+    def test_a_stub_run_refuses_server_options(self):
+        # Review 2/2 should-fix (b), Q166: a stub run was labelled as the live server.
+        for extra in (["--endpoint", "http://127.0.0.1:18087", "--allow-live-server"],
+                      ["--allow-live-server"], ["--endpoint", "http://127.0.0.1:18089"]):
+            with self.assertRaises(SystemExit):
+                g.main(["--stub-model"] + extra)
+
     def test_an_existing_name_is_never_replaced(self):
         (self.art / "g1").mkdir()
         fixed = "g1-20261022T120000-deadbeef.json"

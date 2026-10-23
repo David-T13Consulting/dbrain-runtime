@@ -32,8 +32,9 @@ grammar, everything else `unscored` for the lead to read, never a pass.
             non-answer: 423 paused is a boundary refusal, recorded apart.
 
 Hits come from the actual ask (the runner records what `answer.ask` returned), never from a
-second search. The report is printed; writing it to artifacts/g1/ is S1's Tier 2 part and is
-not built yet. Made-up data only; never David's notes, never the failure store.
+second search. The report is printed; with --write-report it is also kept as one new file
+under artifacts/g1/ (`write_report`). Made-up data only; never David's notes, never the
+failure store.
 """
 import argparse
 import hashlib
@@ -531,7 +532,8 @@ def endpoint_port(endpoint):
         u = urllib.parse.urlsplit(endpoint)
         port = u.port
     except ValueError:
-        raise SystemExit("refusing endpoint %r: not a plain http://host:port" % endpoint)
+        # Never echo the endpoint: it may hold a credential (review 2/2 should-fix, Q166).
+        raise SystemExit("refusing endpoint: use a plain http://host:port")
     if (u.scheme != "http" or not u.hostname or u.username or u.password or u.query
             or u.fragment or u.path not in ("", "/") or port is None):
         raise SystemExit("refusing endpoint: use a plain http://host:port")
@@ -550,6 +552,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if not (args.stub_model or args.endpoint):
         raise SystemExit("name the evaluation server with --endpoint, or use --stub-model")
+    if args.stub_model and (args.endpoint or args.allow_live_server):
+        # A stub run never talks to a server, so its report must not say it did (Q166).
+        raise SystemExit("--stub-model takes no --endpoint or --allow-live-server")
     live = bool(args.endpoint) and endpoint_port(args.endpoint) == LIVE_PORT
     if live and not args.allow_live_server:
         raise SystemExit("refusing the live phone server (port 18087) without --allow-live-server")
