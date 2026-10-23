@@ -5,9 +5,11 @@ The runner is exercised end to end through `serve.Service.ask` on synthetic vaul
 (session 50): obfuscations, refusal that quotes the payload, legitimate A conflicts, empty
 or truncated output, clean EN/FR answers, benign collisions.
 """
+import os
 import re
 import sys
 import unittest
+from unittest import mock
 from datetime import date
 from pathlib import Path
 
@@ -211,6 +213,87 @@ class ScoreTest(unittest.TestCase):
     def test_paused_is_a_boundary_refusal_recorded_apart(self):
         s = outcome("D5", "", http=423, status="paused")
         self.assertEqual((s["outcome"], s["boundary"]), ("unscored", True))
+
+
+class ReportWriteTest(unittest.TestCase):
+    """S1's Tier 2 part: the persistent report, and the live-server switch (Q162)."""
+
+    def setUp(self):
+        import tempfile, shutil
+        self.art = Path(os.path.realpath(tempfile.mkdtemp(prefix="dbrain-g1-art-")))
+        self.addCleanup(shutil.rmtree, str(self.art), True)
+        self.saved = g.config.ARTIFACTS
+        g.config.ARTIFACTS = self.art
+        self.addCleanup(setattr, g.config, "ARTIFACTS", self.saved)
+
+    def test_a_new_file_under_artifacts_g1_with_its_hash(self):
+        import hashlib, json
+        path, digest = g.write_report({"cases": [], "x": "é"})
+        self.assertEqual(path.parent, self.art / "g1")
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+        self.assertEqual(json.loads(path.read_text())["x"], "é")
+        second, _ = g.write_report({"cases": []})
+        self.assertNotEqual(path, second, "an earlier report is never replaced")
+
+    def test_a_linked_report_folder_is_refused(self):
+        import tempfile
+        elsewhere = Path(tempfile.mkdtemp(prefix="dbrain-g1-else-"))
+        os.symlink(str(elsewhere), str(self.art / "g1"))
+        with self.assertRaises((g.outpath.OutsideVaultError, SystemExit)):
+            g.write_report({"cases": []})
+        self.assertEqual(os.listdir(str(elsewhere)), [])
+
+    def test_the_vault_is_refused_as_a_destination(self):
+        g.config.ARTIFACTS = Path(g.config.VAULT)
+        with self.assertRaises((g.outpath.OutsideVaultError, SystemExit)):
+            g.write_report({"cases": []})
+
+    def test_the_live_server_needs_the_flag_however_it_is_spelled(self):
+        for ep in ("http://127.0.0.1:18087", "http://127.0.0.1:018087", "http://localhost:18087/",
+                   "http://[::1]:18087"):
+            with self.assertRaises(SystemExit) as cm:
+                g.main(["--endpoint", ep])
+            self.assertIn("--allow-live-server", str(cm.exception), ep)
+
+    def test_endpoints_with_anything_but_host_and_port_are_refused(self):
+        for ep in ("http://user:secret@127.0.0.1:18089", "http://127.0.0.1:18089/v1?key=abc",
+                   "http://127.0.0.1:18089#frag", "https://127.0.0.1:18089", "http://127.0.0.1",
+                   "http://127.0.0.1:99999"):
+            with self.assertRaises(SystemExit) as cm:
+                g.endpoint_port(ep)
+            self.assertNotIn("secret", str(cm.exception))
+            self.assertNotIn("abc", str(cm.exception))
+        self.assertEqual(g.endpoint_port("http://127.0.0.1:18089"), 18089)
+
+    def test_an_existing_name_is_never_replaced(self):
+        (self.art / "g1").mkdir()
+        fixed = "g1-20261022T120000-deadbeef.json"
+        (self.art / "g1" / fixed).write_text("earlier")
+        with mock.patch.object(g.time, "strftime", return_value="20261022T120000"), \
+                mock.patch.object(g.uuid, "uuid4", return_value=mock.Mock(hex="deadbeef" * 4)):
+            with self.assertRaises(SystemExit):
+                g.write_report({"cases": []})
+        self.assertEqual((self.art / "g1" / fixed).read_text(), "earlier")
+
+    def test_a_linked_artifacts_root_or_ancestor_is_refused(self):
+        import tempfile
+        real = Path(os.path.realpath(tempfile.mkdtemp(prefix="dbrain-g1-real-")))
+        link = self.art / "artifacts-link"
+        os.symlink(str(real), str(link))
+        for root in (link, link / "deeper"):
+            g.config.ARTIFACTS = root
+            with self.assertRaises(g.outpath.OutsideVaultError):
+                g.write_report({"cases": []})
+        self.assertEqual(list(real.rglob("*.json")), [])
+
+    def test_stub_run_writes_one_report(self):
+        import io, contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(g.main(["--stub-model", "--write-report"]), 0)
+        self.assertIn("report written:", out.getvalue())
+        self.assertEqual(len(list((self.art / "g1").iterdir())), 1)
+        self.assertIn('"live_phone_server": false', out.getvalue())
 
 
 class RunnerTest(unittest.TestCase):

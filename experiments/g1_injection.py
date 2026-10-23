@@ -37,6 +37,7 @@ not built yet. Made-up data only; never David's notes, never the failure store.
 """
 import argparse
 import hashlib
+import os
 import json
 import re
 import shutil
@@ -486,20 +487,81 @@ def by_class(cases):
     return out
 
 
+def report_dir():
+    """artifacts/g1 as configured, never resolved first: the guard below refuses it if a
+    link anywhere on the way makes its real path differ (review 1/2, blocker 2)."""
+    return Path(os.path.abspath(str(config.ARTIFACTS))) / "g1"
+
+
+def write_report(report):
+    """S1's persistent report (Tier 2): one new file under artifacts/g1 only. The folder
+    comes from outpath's guard (strict: no link at any depth, never the vault); the file
+    is created relative to it with O_EXCL, so nothing is ever replaced, even by a racing
+    run (review 1/2, blocker 1). Returns (path, sha256 of the bytes)."""
+    data = (json.dumps(report, indent=1, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    folder = report_dir()
+    name = "g1-%s-%s.json" % (time.strftime("%Y%m%dT%H%M%S"), uuid.uuid4().hex[:8])
+    dfd = outpath.open_dir_guarded(folder, strict=True)
+    try:
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | outpath.O_NOFOLLOW, 0o600,
+                         dir_fd=dfd)
+        except FileExistsError:
+            raise SystemExit("refusing to replace %s" % (folder / name))
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+    return folder / name, hashlib.sha256(data).hexdigest()
+
+
+LIVE_PORT = 18087
+
+
+def endpoint_port(endpoint):
+    """The endpoint's numeric port, after refusing anything but a bare scheme://host:port
+    (no credentials, path, query or fragment: nothing secret can reach the report;
+    review 1/2 should-fix). Compared as a number, so ":018087" is 18087 (blocker 3)."""
+    try:
+        u = urllib.parse.urlsplit(endpoint)
+        port = u.port
+    except ValueError:
+        raise SystemExit("refusing endpoint %r: not a plain http://host:port" % endpoint)
+    if (u.scheme != "http" or not u.hostname or u.username or u.password or u.query
+            or u.fragment or u.path not in ("", "/") or port is None):
+        raise SystemExit("refusing endpoint: use a plain http://host:port")
+    return port
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--endpoint", default=None)
     ap.add_argument("--stub-model", action="store_true", help="pipeline only; no weights")
     ap.add_argument("--cases", default=None)
+    ap.add_argument("--write-report", action="store_true",
+                    help="also keep the report under artifacts/g1 (S2)")
+    ap.add_argument("--allow-live-server", action="store_true",
+                    help="permit the phone's own model server, port 18087 (David, Q162)")
     args = ap.parse_args(argv)
     if not (args.stub_model or args.endpoint):
         raise SystemExit("name the evaluation server with --endpoint, or use --stub-model")
-    if args.endpoint and re.search(r":18087\b", args.endpoint):
-        raise SystemExit("refusing the live phone server (port 18087)")
+    live = bool(args.endpoint) and endpoint_port(args.endpoint) == LIVE_PORT
+    if live and not args.allow_live_server:
+        raise SystemExit("refusing the live phone server (port 18087) without --allow-live-server")
     model = (adapter_mod.StubAdapter() if args.stub_model
              else adapter_mod.LlamaCppAdapter(endpoint=args.endpoint))
     report = run(load_cases(args.cases), model)
+    report["server"] = ({"live_phone_server": True, "approved": "Q162 (David, 22 Oct)"}
+                        if live else {"live_phone_server": False})
     print(json.dumps(report, indent=1, sort_keys=True, ensure_ascii=False))
+    if args.write_report:
+        path, digest = write_report(report)
+        print("report written: %s sha256 %s" % (path, digest))
     return 0
 
 
